@@ -14,7 +14,6 @@ import sys
 import json
 import time
 import threading
-import subprocess
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -25,49 +24,16 @@ import openpyxl
 
 # Stage 0：引入 core 纯函数（不依赖 COM / Tk），保持行为一致，供测试与复用
 from core import util as core_util
+# Stage 1：Photoshop 安全资源管理（Session 只关自己 open/duplicate 的文档，绝不关用户文档）
+from core.photoshop import PhotoshopSession, PhotoshopSessionError
 
 # ---------------- Photoshop 资源管理 ----------------
-# 关键问题：Photoshop 一旦被 COM 拉起，若不及时退出会一直驻留内存（数百 MB~数 GB）
-# 并占用暂存盘（scratch）。因此记录是否「由本程序拉起」，用完即关闭所有文档并退出 PS，
-# 把内存和磁盘（暂存文件）及时释放；若 PS 原本就在运行（用户自己开的），则不打扰。
-_PS_LAUNCHED_BY_US = False
-
-
-def _ps_is_running():
-    try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Photoshop.exe"],
-                             capture_output=True, text=True).stdout
-        return "Photoshop.exe" in out
-    except Exception:
-        return False
-
-
-def ps_launch():
-    """连接（必要时拉起）Photoshop；若拉起前未运行，则标记为「本程序拉起」。"""
-    global _PS_LAUNCHED_BY_US
-    was = _ps_is_running()
-    app = win32com.client.Dispatch("Photoshop.Application")
-    app.DisplayDialogs = 3  # psDisplayNoDialogs
-    if not was:
-        _PS_LAUNCHED_BY_US = True
-    return app
-
-
-def ps_cleanup(app, quit_app=False):
-    """关闭所有打开的文档（不保存），并可选退出 Photoshop 以释放内存与暂存盘。"""
-    if app is None:
-        return
-    # 关闭所有残留文档（包括意外残留的「未标题-N」）
-    try:
-        while app.Documents.Count > 0:
-            app.Documents.Item(1).Close(2)  # psDoNotSaveChanges
-    except Exception:
-        pass
-    if quit_app and _PS_LAUNCHED_BY_US:
-        try:
-            app.Quit()
-        except Exception:
-            pass
+# Stage 1 起由 core.photoshop.PhotoshopSession 统一管理：
+#   - Session 实例持有 app_started_by_tool / owned_documents / initial_documents；
+#   - 只关闭 owned documents（本工具 Open / Duplicate 出来的）；
+#   - 绝不遍历 Photoshop 当前全部 Documents 执行 Close；
+#   - 不再使用模块级粘性全局 _PS_LAUNCHED_BY_US；
+#   - 第一版保守 Quit 策略：默认完全不调用 app.Quit()（用户数据安全优先）。
 
 
 APP_TITLE = "七方视频封面批量制作"
@@ -305,8 +271,7 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
       logo_layers (list[str]), store_logo_map (dict store->logo_layer or ""),
       fmt, also_png(bool)
     """
-    pythoncom.CoInitialize()
-    app = None
+    # COM 初始化/反初始化由 PhotoshopSession 的 __enter__/__exit__ 统一负责
     try:
         # ---- 读取 Excel ----
         wb = openpyxl.load_workbook(cfg["xlsx_path"], data_only=True)
@@ -328,106 +293,109 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
             log_cb("没有可处理的数据，已停止。")
             return
 
-        # ---- 连接 Photoshop ----
+        # ---- 连接 Photoshop（Session 只管理自己打开/复制的文档）----
         log_cb("正在启动 / 连接 Photoshop ...")
-        app = ps_launch()
-        doc0 = app.Open(cfg["psd_path"])
-        time.sleep(0.6)
+        with PhotoshopSession() as ps:
+            app = ps.app
+            doc0 = ps.open_document(cfg["psd_path"])
+            time.sleep(0.6)
 
-        text_map = cfg.get("text_map", {})
-        name_layer = text_map.get("姓名", "")
-        phone_layer = text_map.get("电话", "")
-        role_layer = text_map.get("销售顾问", "")
+            text_map = cfg.get("text_map", {})
+            name_layer = text_map.get("姓名", "")
+            phone_layer = text_map.get("电话", "")
+            role_layer = text_map.get("销售顾问", "")
 
-        log_cb(f"模板已加载（{doc0.Width}x{doc0.Height}）。"
-               f"文字层映射：姓名→{name_layer or '（不替换）'}，"
-               f"电话→{phone_layer or '（不替换）'}，"
-               f"销售顾问→{role_layer or '（不替换）'}。")
+            log_cb(f"模板已加载（{doc0.Width}x{doc0.Height}）。"
+                   f"文字层映射：姓名→{name_layer or '（不替换）'}，"
+                   f"电话→{phone_layer or '（不替换）'}，"
+                   f"销售顾问→{role_layer or '（不替换）'}。")
 
-        out_dir = cfg["out_dir"]
-        os.makedirs(out_dir, exist_ok=True)
-        logo_layers = cfg["logo_layers"]
-        store_logo_map = cfg["store_logo_map"]
-        fmt = cfg["fmt"]
-        also_png = cfg["also_png"]
-        col_role = cfg["col_role"]
-        col_name = cfg["col_name"]
-        col_phone = cfg["col_phone"]
-        col_store = cfg["col_store"]
+            out_dir = cfg["out_dir"]
+            os.makedirs(out_dir, exist_ok=True)
+            logo_layers = cfg["logo_layers"]
+            store_logo_map = cfg["store_logo_map"]
+            fmt = cfg["fmt"]
+            also_png = cfg["also_png"]
+            col_role = cfg["col_role"]
+            col_name = cfg["col_name"]
+            col_phone = cfg["col_phone"]
+            col_store = cfg["col_store"]
 
-        total = len(data)
-        done = 0
-        t0 = time.time()
-        for idx, r in enumerate(data, start=1):
-            if stop_flag.is_set():
-                log_cb("用户已停止。")
-                break
-            store = str(r[col_store]).strip() if r[col_store] is not None else ""
-            name = str(r[col_name]).strip()
-            phone_v = r[col_phone]
-            phone_s = str(int(phone_v)) if isinstance(phone_v, (int, float)) else str(phone_v).strip()
-            if col_role >= 0 and col_role < len(r) and r[col_role] is not None:
-                role = str(r[col_role]).strip()
-            else:
-                role = None
-
-            d = doc0.Duplicate()
-            app.ActiveDocument = d
-            time.sleep(0.05)
-
-            # 姓名（字号样式与 PSD 模板保持一致，长姓名不缩放）
-            if name_layer:
-                nl = find_layer(d, name_layer)
-                if nl is not None:
-                    set_text_safe(nl, name)
-            # 电话
-            if phone_layer:
-                safe_replace_text(d, phone_layer, phone_s, log_cb)
-            # 销售顾问（仅当 Excel 该列有值）
-            if role_layer and role is not None:
-                safe_replace_text(d, role_layer, role, log_cb)
-
-            # Logo 图层切换：只显示本门店对应的 Logo，隐藏其余候选 Logo；
-            # 品牌 Logo（含 'logo' 且非门店 Logo）每张封面强制显示
-            mapped = store_logo_map.get(store, "")
-            brand = brand_logos_for(logo_layers, store_logo_map)
-            for ln in logo_layers:
-                if ln in brand:
-                    set_layer_visible_by_name(d, ln, visible=True)
+            total = len(data)
+            done = 0
+            t0 = time.time()
+            for idx, r in enumerate(data, start=1):
+                if stop_flag.is_set():
+                    log_cb("用户已停止。")
+                    break
+                store = str(r[col_store]).strip() if r[col_store] is not None else ""
+                name = str(r[col_name]).strip()
+                phone_v = r[col_phone]
+                phone_s = str(int(phone_v)) if isinstance(phone_v, (int, float)) else str(phone_v).strip()
+                if col_role >= 0 and col_role < len(r) and r[col_role] is not None:
+                    role = str(r[col_role]).strip()
                 else:
-                    set_layer_visible_by_name(d, ln, visible=(ln == mapped))
+                    role = None
 
-            safe_store = core_util.sanitize_filename(store)
-            safe_name = core_util.sanitize_filename(name)
-            base = f"{idx:03d}_{safe_store}_{safe_name}"
-            if fmt == FMT_PSD:
-                p = os.path.join(out_dir, base + ".psd")
-                export_doc(d, p, FMT_PSD)
-                if also_png:
-                    export_doc(d, os.path.join(out_dir, base + ".png"), FMT_PNG)
-            else:
-                p = os.path.join(out_dir, base + "." + fmt.lower())
-                export_doc(d, p, fmt)
+                d = None
+                try:
+                    d = ps.duplicate_document(doc0)
+                    app.ActiveDocument = d
+                    time.sleep(0.05)
 
-            d.Close(2)
-            time.sleep(0.05)
+                    # 姓名（字号样式与 PSD 模板保持一致，长姓名不缩放）
+                    if name_layer:
+                        nl = find_layer(d, name_layer)
+                        if nl is not None:
+                            set_text_safe(nl, name)
+                    # 电话
+                    if phone_layer:
+                        safe_replace_text(d, phone_layer, phone_s, log_cb)
+                    # 销售顾问（仅当 Excel 该列有值）
+                    if role_layer and role is not None:
+                        safe_replace_text(d, role_layer, role, log_cb)
 
-            done += 1
-            if done % 5 == 0 or done == total:
-                el = time.time() - t0
-                progress_cb(done, total)
-                log_cb(f"  已生成 {done}/{total}  （{el:.1f}s）")
+                    # Logo 图层切换：只显示本门店对应的 Logo，隐藏其余候选 Logo；
+                    # 品牌 Logo（含 'logo' 且非门店 Logo）每张封面强制显示
+                    mapped = store_logo_map.get(store, "")
+                    brand = brand_logos_for(logo_layers, store_logo_map)
+                    for ln in logo_layers:
+                        if ln in brand:
+                            set_layer_visible_by_name(d, ln, visible=True)
+                        else:
+                            set_layer_visible_by_name(d, ln, visible=(ln == mapped))
 
-        doc0.Close(2)
-        el = time.time() - t0
-        log_cb(f"完成！共生成 {done} 张，耗时 {el:.1f}s。输出目录：{out_dir}")
+                    safe_store = core_util.sanitize_filename(store)
+                    safe_name = core_util.sanitize_filename(name)
+                    base = f"{idx:03d}_{safe_store}_{safe_name}"
+                    if fmt == FMT_PSD:
+                        p = os.path.join(out_dir, base + ".psd")
+                        export_doc(d, p, FMT_PSD)
+                        if also_png:
+                            export_doc(d, os.path.join(out_dir, base + ".png"), FMT_PNG)
+                    else:
+                        p = os.path.join(out_dir, base + "." + fmt.lower())
+                        export_doc(d, p, fmt)
+
+                    done += 1
+                    if done % 5 == 0 or done == total:
+                        el = time.time() - t0
+                        progress_cb(done, total)
+                        log_cb(f"  已生成 {done}/{total}  （{el:.1f}s）")
+                finally:
+                    # 无论本行成功/失败，都关闭本工具创建的 duplicate，绝不波及用户文档
+                    if d is not None:
+                        try:
+                            ps.close_owned_document(d)
+                        except Exception as e:
+                            log_cb(f"  警告：关闭副本失败：{e}")
+
+            el = time.time() - t0
+            log_cb(f"完成！共生成 {done} 张，耗时 {el:.1f}s。输出目录：{out_dir}")
     except Exception as e:
         log_cb(f"错误：{e}")
         import traceback
         log_cb(traceback.format_exc())
-    finally:
-        ps_cleanup(app, quit_app=True)
-        pythoncom.CoUninitialize()
 
 
 # ----------------------------------------------------------------------------
@@ -705,31 +673,20 @@ class App:
             messagebox.showerror("Excel 错误", str(e))
             return
 
-        # 读取 PSD 图层（通过 Photoshop COM）
+        # 读取 PSD 图层（通过 Photoshop COM；Session 负责 COM 初始化并只关闭自己打开的文档）
         try:
             self._log_gui(f"正在用 Photoshop 解析 PSD 图层：{os.path.basename(psd)}")
-            pythoncom.CoInitialize()
-            app = None
-            app = ps_launch()
-            doc = app.Open(psd)
-            time.sleep(0.6)
-            layers = collect_layer_names(doc)  # [(name, is_group, parent_name)]
-            self.all_text_layers = collect_text_layer_names(doc)
-            doc.Close(2)
-            # PSD 解析完成，立即关闭并退出 Photoshop，释放内存与暂存盘
-            ps_cleanup(app, quit_app=True)
-            app = None
-            pythoncom.CoUninitialize()
+            with PhotoshopSession() as ps:
+                doc = ps.open_document(psd)
+                time.sleep(0.6)
+                layers = collect_layer_names(doc)  # [(name, is_group, parent_name)]
+                self.all_text_layers = collect_text_layer_names(doc)
+                # with 退出：Session 只关闭自己打开的 doc（即上面的模板文档）
             self.all_psd_layers = [n for n, _, _ in layers]
             self.all_psd_is_group = {n: g for n, g, _ in layers}
             self.all_psd_parent = {n: p for n, _, p in layers}
         except Exception as e:
             messagebox.showerror("PSD 错误", f"无法解析 PSD（请确认 Photoshop 已安装并可启动）：\n{e}")
-            ps_cleanup(app, quit_app=True)
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
             return
 
         # 默认勾选 Logo 候选：名称含 "logo"，或位于名为 logo 的组内，
@@ -950,10 +907,8 @@ class App:
         cfg = dict(cfg)
         cfg["out_dir"] = tmp
         self._log_gui("生成预览（第1行数据）...")
-        # 预览只做第一行：用 col 读取第1行
+        # 预览只做第一行：用 col 读取第1行（COM 初始化由 Session 负责）
         try:
-            pythoncom.CoInitialize()
-            app = None
             wb = openpyxl.load_workbook(cfg["xlsx_path"], data_only=True)
             ws = wb.active
             rows = list(ws.iter_rows(values_only=True))
@@ -967,54 +922,54 @@ class App:
             if cfg["col_role"] >= 0 and cfg["col_role"] < len(r) and r[cfg["col_role"]] is not None:
                 role = str(r[cfg["col_role"]]).strip()
 
-            app = ps_launch()
-            doc0 = app.Open(cfg["psd_path"])
-            time.sleep(0.6)
+            with PhotoshopSession() as ps:
+                app = ps.app
+                doc0 = ps.open_document(cfg["psd_path"])
+                time.sleep(0.6)
 
-            text_map = cfg.get("text_map", {})
-            name_layer = text_map.get("姓名", "")
-            phone_layer = text_map.get("电话", "")
-            role_layer = text_map.get("销售顾问", "")
+                text_map = cfg.get("text_map", {})
+                name_layer = text_map.get("姓名", "")
+                phone_layer = text_map.get("电话", "")
+                role_layer = text_map.get("销售顾问", "")
 
-            d = doc0.Duplicate()
-            app.ActiveDocument = d
-            time.sleep(0.05)
+                d = None
+                try:
+                    d = ps.duplicate_document(doc0)
+                    app.ActiveDocument = d
+                    time.sleep(0.05)
 
-            if name_layer:
-                nl = find_layer(d, name_layer)
-                if nl is not None:
-                    set_text_safe(nl, name)
-            if phone_layer:
-                safe_replace_text(d, phone_layer, phone_s, self._log_gui)
-            if role_layer and role is not None:
-                safe_replace_text(d, role_layer, role, self._log_gui)
+                    if name_layer:
+                        nl = find_layer(d, name_layer)
+                        if nl is not None:
+                            set_text_safe(nl, name)
+                    if phone_layer:
+                        safe_replace_text(d, phone_layer, phone_s, self._log_gui)
+                    if role_layer and role is not None:
+                        safe_replace_text(d, role_layer, role, self._log_gui)
 
-            mapped = cfg["store_logo_map"].get(store, "")
-            brand = brand_logos_for(cfg["logo_layers"], cfg["store_logo_map"])
-            for ln in cfg["logo_layers"]:
-                if ln in brand:
-                    set_layer_visible_by_name(d, ln, visible=True)
-                else:
-                    set_layer_visible_by_name(d, ln, visible=(ln == mapped))
-            p = os.path.join(tmp, "preview.png")
-            export_doc(d, p, FMT_PNG)
-            d.Close(2)
-            doc0.Close(2)
-            ps_cleanup(app, quit_app=True)
-            app = None
-            pythoncom.CoUninitialize()
-            self._log_gui(f"预览已生成：{p}")
-            try:
-                os.startfile(p)
-            except Exception:
-                pass
+                    mapped = cfg["store_logo_map"].get(store, "")
+                    brand = brand_logos_for(cfg["logo_layers"], cfg["store_logo_map"])
+                    for ln in cfg["logo_layers"]:
+                        if ln in brand:
+                            set_layer_visible_by_name(d, ln, visible=True)
+                        else:
+                            set_layer_visible_by_name(d, ln, visible=(ln == mapped))
+                    p = os.path.join(tmp, "preview.png")
+                    export_doc(d, p, FMT_PNG)
+                    self._log_gui(f"预览已生成：{p}")
+                    try:
+                        os.startfile(p)
+                    except Exception:
+                        pass
+                finally:
+                    # 无论预览成败，都关闭本工具创建的 duplicate，绝不波及用户文档
+                    if d is not None:
+                        try:
+                            ps.close_owned_document(d)
+                        except Exception as e:
+                            self._log_gui(f"  警告：关闭预览副本失败：{e}")
         except Exception as e:
             self._log_gui(f"预览失败：{e}")
-            ps_cleanup(app, quit_app=True)
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
 
     def _stop(self):
         if self.running:
@@ -1086,13 +1041,9 @@ def main():
     App(root)
 
     def _on_exit():
-        # 程序退出时，若 Photoshop 是由本程序拉起的且仍在运行，确保退出以释放内存/暂存盘
-        if _PS_LAUNCHED_BY_US and _ps_is_running():
-            try:
-                a = win32com.client.Dispatch("Photoshop.Application")
-                ps_cleanup(a, quit_app=True)
-            except Exception:
-                pass
+        # Stage 1：不再依赖模块级 _PS_LAUNCHED_BY_US 做全局 Quit 判断。
+        # Session 的 ownership 只属于各自实例；窗口退出时不做任何跨 Session 的
+        # Photoshop Quit / 关闭用户文档动作（避免误伤用户正在使用的 Photoshop）。
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_exit)
