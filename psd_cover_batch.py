@@ -130,14 +130,20 @@ def inspect(psd_path, xlsx_path):
                 stores.add(str(r[STORE_COL]).strip())
     top_logos = [l.Name for l in doc.Layers
                  if l.Name.strip() in stores and "__group__:" + l.Name not in registry]
+    brand_logos = [l.Name for l in doc.Layers
+                   if "logo" in l.Name.lower()
+                   and l.Name.strip() not in stores
+                   and "__group__:" + l.Name not in registry]
     print("\n匹配到的门店 Logo 图层（图层名 == Excel 门店名）:")
     print("  " + (", ".join(top_logos) if top_logos else "(无，请检查门店名是否与图层名一致)"))
+    print("\n品牌 Logo 图层（名字含 logo，每张封面都显示）:")
+    print("  " + (", ".join(brand_logos) if brand_logos else "(无)"))
 
     com_call(doc.Close, 2)
     pythoncom.CoUninitialize()
 
 
-def run(psd_path, xlsx_path, out_dir, row=None):
+def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
     os.makedirs(out_dir, exist_ok=True)
     pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
     ps = com_call(win32com.client.Dispatch, "Photoshop.Application")
@@ -157,7 +163,18 @@ def run(psd_path, xlsx_path, out_dir, row=None):
     stores = set(str(r[STORE_COL]).strip() for r in data if r and r[STORE_COL])
     store_logos = [l.Name for l in doc.Layers
                    if l.Name.strip() in stores and "__group__:" + l.Name not in registry]
+    # 品牌 Logo：名字含 "logo"（且不正好等于门店名）的图层 —— 每张封面都显示，
+    # 例如「七方logo」「七方logo 拷贝」。可用 --brand-logo 显式指定覆盖自动识别。
+    auto_brand = [l.Name for l in doc.Layers
+                  if "logo" in l.Name.lower()
+                  and l.Name.strip() not in stores
+                  and "__group__:" + l.Name not in registry]
+    if brand_logos:
+        brand_logos = [nm for nm in brand_logos if nm in registry and "__group__:" + nm not in registry]
+    else:
+        brand_logos = auto_brand
     print(f"检测到门店 Logo 图层 {len(store_logos)} 个: {store_logos}")
+    print(f"品牌 Logo 图层（始终显示）{len(brand_logos)} 个: {brand_logos}")
 
     todo = [row - 1] if row else list(range(len(data)))
     exported = 0
@@ -184,7 +201,9 @@ def run(psd_path, xlsx_path, out_dir, row=None):
 
         for nm in store_logos:
             registry[nm].Visible = (nm.strip() == store)
-        print(f"  门店 Logo: 显示 {store!r}，隐藏其余")
+        for nm in brand_logos:
+            registry[nm].Visible = True
+        print(f"  门店 Logo: 显示 {store!r}，隐藏其余；品牌 Logo: 全部显示")
 
         fname = f"{idx + 1:03d}_{sanitize(store)}_{sanitize(name)}.png"
         out_path = os.path.join(out_dir, fname)
@@ -205,13 +224,15 @@ def main():
     ap.add_argument("--xlsx", required=True, help="Excel 数据路径")
     ap.add_argument("--out", default="./out", help="PNG 输出目录")
     ap.add_argument("--row", type=int, default=0, help="只合成指定行（1 开始），0 表示全部")
+    ap.add_argument("--brand-logo", action="append", default=[],
+                    help="品牌 Logo 图层名（每张封面都显示，如 七方logo）。可重复指定；不指定则自动识别名字含 logo 的图层")
     ap.add_argument("--inspect", action="store_true", help="只打印图层树后退出")
     args = ap.parse_args()
 
     if args.inspect:
         inspect(args.psd, args.xlsx)
         return
-    run(args.psd, args.xlsx, args.out, row=args.row or None)
+    run(args.psd, args.xlsx, args.out, row=args.row or None, brand_logos=args.brand_logo or None)
 
 
 if __name__ == "__main__":
