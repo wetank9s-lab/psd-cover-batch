@@ -707,6 +707,8 @@ class App:
         self.excel_headers = []
         # Stage 4：当前加载的 ExcelDataset（统一数据源；_load 后才有值）
         self.excel_dataset = None
+        # Stage 4 补充（BLOCKED 修复）：Dataset 一致性 key —— path/has_header/4 列任一变化即失效
+        self._ds_key = None
         self.running = False
         self.stop_flag = threading.Event()
         self.worker = None
@@ -981,6 +983,101 @@ class App:
                 cb["values"] = labels + (["（不替换）"] if cb is self.col_role_cb else [])
 
     # ---------------- 加载解析 ----------------
+    def _ds_cache_key(self):
+        """Dataset 一致性 key：path + has_header + 4 列配置。任一变化即失效。"""
+        return (
+            self.xlsx_var.get().strip(),
+            bool(self.header_var.get()),
+            self._col_of(self.col_store_var.get()),
+            self._col_of(self.col_name_var.get()),
+            self._col_of(self.col_phone_var.get()),
+            self._col_of(self.col_role_var.get()),
+        )
+
+    def _load_excel_data(self, xlsx=None):
+        """仅加载 Excel -> 更新 self.excel_dataset / excel_stores / 列下拉。
+
+        返回 True 成功；False 失败（已弹窗）。供 _load 与 _ensure_dataset_fresh 共用。
+        """
+        if xlsx is None:
+            xlsx = self.xlsx_var.get().strip()
+        try:
+            ds = load_excel_dataset(
+                xlsx,
+                has_header=self.header_var.get(),
+                col_store=self._col_of(self.col_store_var.get()),
+                col_name=self._col_of(self.col_name_var.get()),
+                col_phone=self._col_of(self.col_phone_var.get()),
+                col_role=self._col_of(self.col_role_var.get()),
+            )
+            self.excel_dataset = ds
+            self._ds_key = self._ds_cache_key()
+            # 动态生成列下拉（按实际最大列数，支持 A..Z/AA/AB...）
+            self._set_column_options(ds.max_columns)
+            self.excel_headers = [index_to_excel_column(i) for i in range(ds.max_columns)]
+            self.excel_stores = ds.stores
+            return True
+        except ExcelDataError as e:
+            messagebox.showerror("Excel 错误", str(e))
+            return False
+        except Exception as e:
+            messagebox.showerror("Excel 错误", str(e))
+            return False
+
+    def _ensure_dataset_fresh(self, trigger="start"):
+        """Stage 4 补充（BLOCKED B/C）：开始/预览前保证 Dataset 与当前控件配置一致。
+
+        若 path / has_header / col_store / col_name / col_phone / col_role 任一
+        与上次加载不一致 -> 自动重解析 Excel（不必等用户重新点「加载」），
+        并同步重建门店->Logo 映射区（避免 Logo 页旧门店列表 + Batch 新列错配）。
+        返回 True 可继续；False 已弹窗报错。
+        """
+        if self.excel_dataset is None:
+            return True   # 未加载过（_start/_preview 要求先点加载，这里兜底）
+        cur = self._ds_cache_key()
+        if cur == self._ds_key:
+            return True
+        # 配置变化 -> 重新解析 Excel
+        self._log_gui(f"[Excel 重解析] 字段映射/表头已变化（{trigger}前自动刷新），正在重新读取 Excel ...")
+        if not self._load_excel_data():
+            return False
+        # 若 PSD 已加载（有 layer_index），同步重建门店映射区
+        if self.layer_index is not None and self.map_combos:
+            self._rebuild_store_map_ui()
+        return True
+
+    def _rebuild_store_map_ui(self):
+        """按当前 excel_stores 重建门店->Logo 映射下拉区。
+
+        - 保留旧门店（同名）已选映射值（用户人工选择不丢失）；
+        - 新增门店：自动 match_store_logo（EXACT/AUTO 唯一命中才选，歧义/无匹配 -> 无）。
+        - 消失的门店：其映射自然移除（不再是 stores 一员）。
+        """
+        stores = self.excel_stores
+        prev_combos = self.map_combos
+        prev_map = {}
+        for s, var in prev_combos.items():
+            prev_map[s] = var.get()
+        self.map_combos = {}
+        selected_refs = self._selected_logo_refs()
+        try:
+            effective_leaves = resolve_effective_logo_layers(self.layer_index, selected_refs)
+        except Exception:
+            effective_leaves = []
+        for s in stores:
+            default_label = prev_map.get(s, "（无）")
+            if default_label != "（无）" and self._label_to_ref(default_label) is not None:
+                pass   # 保留旧值
+            else:
+                mr = match_store_logo(s, effective_leaves)
+                if mr.status in (EXACT, AUTO) and mr.best is not None:
+                    default_label = self.layer_labels[mr.best.id]
+                else:
+                    default_label = "（无）"
+            self.map_combos[s] = tk.StringVar(value=default_label)
+        self._rebuild_logo_lists()
+        self._log_gui(f"门店映射已按新 Excel 列刷新：{len(stores)} 个门店。")
+
     def _load(self):
         psd = self.psd_var.get().strip()
         xlsx = self.xlsx_var.get().strip()
@@ -993,26 +1090,7 @@ class App:
 
         # 读取 Excel 门店 + 列头（Stage 4：统一入口 load_excel_dataset，修复 P1-01 ——
         # 门店不再固定取 A 列，而是按用户配置的 col_store 列读取）
-        try:
-            ds = load_excel_dataset(
-                xlsx,
-                has_header=self.header_var.get(),
-                col_store=self._col_of(self.col_store_var.get()),
-                col_name=self._col_of(self.col_name_var.get()),
-                col_phone=self._col_of(self.col_phone_var.get()),
-                col_role=self._col_of(self.col_role_var.get()),
-            )
-            self.excel_dataset = ds
-            # 动态生成列下拉（按实际最大列数，支持 A..Z/AA/AB...）
-            self._set_column_options(ds.max_columns)
-            self.excel_headers = [index_to_excel_column(i) for i in range(ds.max_columns)]
-            stores = ds.stores
-            self.excel_stores = stores
-        except ExcelDataError as e:
-            messagebox.showerror("Excel 错误", str(e))
-            return
-        except Exception as e:
-            messagebox.showerror("Excel 错误", str(e))
+        if not self._load_excel_data(xlsx):
             return
 
         # 读取 PSD 图层（通过 Photoshop COM；Session 负责 COM 初始化并只关闭自己打开的文档）
@@ -1047,6 +1125,7 @@ class App:
         #   展开 = resolve_effective_logo_layers(selected) -> 叶子候选
         #   映射 = store_logo_map（叶子 LayerRef）+ brand_logo_refs（叶子 LayerRef）
         # 名称启发式只用于「首次自动推荐」；运行时绝不再次 name 猜测。
+        stores = self.excel_stores   # Stage 4：来自 _load_excel_data 的 dataset.stores
         def is_logo_candidate(ref):
             # 仅用于首次加载的推荐勾选（不是运行时规则）
             if ref.is_group:
@@ -1460,6 +1539,9 @@ class App:
     def _start(self):
         if self.running:
             return
+        # Stage 4 补充（BLOCKED B/C）：开始前自动重解析，保证 Dataset 与当前列配置一致
+        if not self._ensure_dataset_fresh(trigger="开始"):
+            return
         cfg = self._collect_cfg()
         if not cfg["psd_path"] or not os.path.exists(cfg["psd_path"]):
             messagebox.showerror("错误", "请先选择 PSD 模板。")
@@ -1492,6 +1574,9 @@ class App:
 
     def _preview(self):
         if self.running:
+            return
+        # Stage 4 补充（BLOCKED B/C）：预览前自动重解析，保证 Dataset 与当前列配置一致
+        if not self._ensure_dataset_fresh(trigger="预览"):
             return
         cfg = self._collect_cfg()
         if not cfg["psd_path"] or not os.path.exists(cfg["psd_path"]) or \

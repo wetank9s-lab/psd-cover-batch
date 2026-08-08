@@ -180,6 +180,7 @@ def parse_row(
     col_name: int = 1,
     col_phone: int = 3,
     col_role: int = 2,
+    require_store: bool = False,
     require_name: bool = True,
     require_phone: bool = True,
 ) -> Optional[ExcelRow]:
@@ -187,6 +188,7 @@ def parse_row(
 
     - 列索引越界时按「空值」处理；
     - 空白字符串视为空值；
+    - require_store=True 时门店为空的行返回 None（跳过）；
     - name 为空（或未配置必填 phone 时 phone 为空）返回 None（跳过）；
     - 保留物理行号 excel_row。
     """
@@ -207,6 +209,8 @@ def parse_row(
     role_s = str(role).strip() if role is not None else ""
     phone_s = format_phone(phone)
 
+    if require_store and not store_s:
+        return None
     if require_name and not name_s:
         return None
     if require_phone and not phone_s:
@@ -230,6 +234,7 @@ def parse_rows(
     col_name: int = 1,
     col_phone: int = 3,
     col_role: int = 2,
+    require_store: bool = False,
     require_name: bool = True,
     require_phone: bool = True,
 ):
@@ -253,11 +258,13 @@ def parse_rows(
             col_name=col_name,
             col_phone=col_phone,
             col_role=col_role,
+            require_store=require_store,
             require_name=require_name,
             require_phone=require_phone,
         )
         if r is None:
-            reason = _skip_reason(raw, col_name=col_name, col_phone=col_phone,
+            reason = _skip_reason(raw, col_store=col_store, col_name=col_name,
+                                  col_phone=col_phone, require_store=require_store,
                                   require_name=require_name, require_phone=require_phone)
             skipped.append(SkippedRow(excel_row=physical, reason=reason))
         else:
@@ -265,17 +272,24 @@ def parse_rows(
     return valid, skipped
 
 
-def _skip_reason(raw, *, col_name, col_phone, require_name, require_phone) -> str:
+def _skip_reason(raw, *, col_store, col_name, col_phone,
+                 require_store, require_name, require_phone) -> str:
     """生成跳过原因（用于 SkippedRow.reason）。"""
     n = len(raw) if raw is not None else 0
 
     def cell(idx):
         return raw[idx] if raw is not None and 0 <= idx < n else None
 
+    store = cell(col_store)
     name = cell(col_name)
     phone = cell(col_phone)
+    store_s = str(store).strip() if store is not None else ""
     name_s = str(name).strip() if name is not None else ""
     phone_s = format_phone(phone)
+    if require_store and not store_s:
+        if store is None:
+            return "门店为空（门店用于 Logo 功能）"
+        return f"门店为空（原值 {store!r} 为空白）"
     if require_name and not name_s:
         if name is None:
             return "姓名为空（请填写姓名）"
@@ -385,6 +399,7 @@ def load_excel_dataset(
         col_name=col_name,
         col_phone=col_phone,
         col_role=col_role,
+        require_store=require_store,
         require_name=require_name,
         require_phone=require_phone,
     )

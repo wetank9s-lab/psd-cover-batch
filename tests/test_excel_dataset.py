@@ -459,3 +459,184 @@ def test_dataset_require_phone_false(tmp_path):
     ds = load_excel_dataset(p, require_phone=False)
     assert ds.valid_rows[0].phone == ""
     assert ds.valid_rows[0].name == "王兵"
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 验收补测（BLOCKED 清单）
+# ---------------------------------------------------------------------------
+# 场景 14：门店为空（require_store=True）-> skipped
+def test_store_blank_with_require_store_skipped(tmp_path):
+    p = _make_xlsx(tmp_path, [
+        ["门店", "姓名", "职位", "电话"],
+        [None, "王兵", "销售顾问", 13800000001],     # 门店空
+        ["易田电器", "张三", "销售顾问", 13800000002],
+    ])
+    ds = load_excel_dataset(p, require_store=True)
+    assert [r.excel_row for r in ds.valid_rows] == [3]
+    assert [s.excel_row for s in ds.skipped_rows] == [2]
+    assert "门店" in ds.skipped_rows[0].reason
+
+
+# 场景 14b：require_store=False 显式关闭 —— 门店空仍算有效（仅 name/phone 必填）
+def test_store_blank_not_required_when_disabled(tmp_path):
+    p = _make_xlsx(tmp_path, [
+        ["门店", "姓名", "职位", "电话"],
+        [None, "王兵", "销售顾问", 13800000001],
+    ])
+    ds = load_excel_dataset(p, require_store=False)
+    assert len(ds.valid_rows) == 1
+    assert ds.valid_rows[0].store == ""
+    assert ds.stores == []       # 空门店不进入 stores 列表
+
+
+# 场景 36：unsupported extension rejected（.txt / 无扩展名）
+def test_error_unsupported_extension_txt(tmp_path):
+    p = tmp_path / "data.txt"
+    p.write_text("not excel", encoding="utf-8")
+    with pytest.raises(ExcelDataError) as ei:
+        load_excel_dataset(str(p))
+    assert ei.value.code == "UNSUPPORTED_TYPE"
+
+
+def test_error_no_extension(tmp_path):
+    p = tmp_path / "noext"
+    p.write_bytes(b"x")
+    with pytest.raises(ExcelDataError) as ei:
+        load_excel_dataset(str(p))
+    assert ei.value.code == "UNSUPPORTED_TYPE"
+
+
+# 场景 40：blank store 不进入 stores（保序去重且跳过空）
+def test_blank_store_not_included(tmp_path):
+    p = _make_xlsx(tmp_path, [
+        ["门店", "姓名", "职位", "电话"],
+        ["易田电器", "王兵", "销售顾问", 13800000001],
+        ["", "张三", "销售顾问", 13800000002],        # 空字符串门店（默认 require_store -> 跳过）
+        ["   ", "李四", "销售顾问", 13800000003],      # 空白门店（默认 require_store -> 跳过）
+        ["康乐", "赵六", "销售顾问", 13800000004],
+    ])
+    ds = load_excel_dataset(p)   # 默认 require_store=True
+    assert ds.stores == ["易田电器", "康乐"]           # 空白门店被排除（且被跳过）
+    assert [r.store for r in ds.valid_rows] == ["易田电器", "康乐"]
+    assert [s.excel_row for s in ds.skipped_rows] == [3, 4]
+
+
+# 场景 18：第一数据行无效、第二数据有效 -> valid_rows[0] 是第二数据行
+def test_first_data_row_invalid_second_valid(tmp_path):
+    p = _make_xlsx(tmp_path, [
+        ["门店", "姓名", "职位", "电话"],
+        ["易田电器", "", "销售顾问", 13800000001],     # 姓名为空 -> 无效
+        ["康乐", "张三", "销售顾问", 13800000002],     # 第一条有效
+    ])
+    ds = load_excel_dataset(p)
+    assert len(ds.valid_rows) == 1
+    assert ds.valid_rows[0].excel_row == 3
+    assert ds.valid_rows[0].store == "康乐"
+    assert ds.valid_rows[0].name == "张三"
+    assert [s.excel_row for s in ds.skipped_rows] == [2]
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED B：字段映射改变后 Dataset 不会陈旧（store B -> E）
+# 与 _ensure_dataset_fresh 的 GUI 行为（见 test_gui_* 无头集成测试）
+# ---------------------------------------------------------------------------
+def test_store_column_change_rebuilds_dataset(tmp_path):
+    """同会话内 col_store 从 B 改为 E 后重新解析 -> stores 用新列（核心逻辑）。"""
+    p = _make_xlsx(tmp_path, [
+        ["编号", "门店旧", "姓名", "电话", "门店新"],
+        [1, "A门店", "张三", 13800000001, "X门店"],
+        [2, "B门店", "李四", 13800000002, "Y门店"],
+    ])
+    # 第一次：col_store=B(1)
+    ds1 = load_excel_dataset(p, col_store=1, col_name=2, col_phone=3)
+    assert ds1.stores == ["A门店", "B门店"]
+    # 第二次（同会话，新配置）：col_store=E(4)
+    ds2 = load_excel_dataset(p, col_store=4, col_name=2, col_phone=3)
+    assert ds2.stores == ["X门店", "Y门店"]
+    # 第一条有效行也从 E 列取门店
+    assert ds2.valid_rows[0].store == "X门店"
+    assert ds2.valid_rows[0].name == "张三"
+
+
+def test_has_header_change_rebuilds_dataset(tmp_path):
+    """同会话内 has_header 从 True 切 False -> 行定义变化（首行被当作数据）。"""
+    p = _make_xlsx(tmp_path, [
+        ["门店", "姓名", "职位", "电话"],
+        ["易田电器", "王兵", "销售顾问", 13800000001],
+    ])
+    ds_true = load_excel_dataset(p, has_header=True)
+    assert ds_true.valid_rows[0].excel_row == 2
+    assert ds_true.valid_rows[0].name == "王兵"
+    # 同会话切 has_header=False：表头行变成数据行（name=表头值）
+    ds_false = load_excel_dataset(p, has_header=False)
+    assert ds_false.valid_rows[0].excel_row == 1
+    assert ds_false.valid_rows[0].name == "姓名"     # 表头行被视为数据
+    assert ds_false.valid_rows[1].name == "王兵"
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED B/C：GUI 无头集成 —— 模拟 _load -> 改列 -> _start/_preview 前自动重解析
+# ---------------------------------------------------------------------------
+def _gui_app_instance():
+    """创建真实 tk App 实例（不 mainloop），返回 (root, app)。"""
+    import tkinter as tk
+    import qifang_cover_maker as g
+    root = tk.Tk()
+    root.withdraw()
+    app = g.App(root)
+    return root, app
+
+
+def test_gui_store_column_change_rebuilds_mapping(tmp_path):
+    """GUI 同会话：col_store B -> E 后，_ensure_dataset_fresh 自动重解析 + 重建映射区。
+
+    证明 Logo 页 store list 与 Batch 使用同一新列（不会出现旧列表 + 新列错配）。
+    """
+    import qifang_cover_maker as g
+    p = _make_xlsx(tmp_path, [
+        ["编号", "门店旧", "姓名", "电话", "门店新"],
+        [1, "A门店", "张三", 13800000001, "X门店"],
+        [2, "B门店", "李四", 13800000002, "Y门店"],
+    ])
+    app = g.App.__new__(g.App)  # 不跑 __init__（避免全量 UI），手工构造最小状态
+    try:
+        # 最小 GUI 状态：Excel 段所需控件 + Logo 映射所需
+        app.xlsx_var = type("V", (), {"get": lambda self: p, "set": lambda self, v: None})()
+        app.header_var = type("V", (), {"get": lambda self: True, "set": lambda self, v: None})()
+        app.col_store_var = type("V", (), {"get": lambda self: "B", "set": lambda self, v: None})()
+        app.col_name_var = type("V", (), {"get": lambda self: "C", "set": lambda self, v: None})()
+        app.col_phone_var = type("V", (), {"get": lambda self: "D", "set": lambda self, v: None})()
+        app.col_role_var = type("V", (), {"get": lambda self: "（不替换）", "set": lambda self, v: None})()
+        app.excel_dataset = None
+        app._ds_key = None
+        app.excel_stores = []
+        app.excel_headers = []
+        app.layer_index = None
+        app.map_combos = {}
+        app._column_labels = []
+        app.col_store_cb = None
+        app.col_name_cb = None
+        app.col_phone_cb = None
+        app.col_role_cb = None
+        # _log_gui 用打印替代（避免依赖真实 tk 日志控件）
+        def _fake_log(self, msg):
+            pass
+        app._log_gui = _fake_log.__get__(app)
+
+        # 1) 首次加载（col_store=B）
+        assert app._load_excel_data(p)
+        assert app.excel_stores == ["A门店", "B门店"]
+        assert app._ds_key[2] == 1   # col_store 索引 1
+
+        # 2) 用户改门店列为 E
+        app.col_store_var.get = lambda: "E"
+        # 此时 _ds_key 仍为旧值 -> _ensure_dataset_fresh 应自动重解析
+        assert app._ensure_dataset_fresh(trigger="开始")
+        assert app.excel_stores == ["X门店", "Y门店"]
+        assert app._ds_key[2] == 4   # col_store 索引 4
+        # 3) 配置未变 -> 不重复解析（仍一致）
+        assert app._ensure_dataset_fresh(trigger="开始")
+        assert app.excel_stores == ["X门店", "Y门店"]
+    finally:
+        pass
+
