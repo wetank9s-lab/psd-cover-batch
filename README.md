@@ -61,7 +61,7 @@ pip install -r requirements.txt
 python psd_cover_batch.py --psd 8081.psd --xlsx 门店销售0803销售顾问.xlsx --inspect
 ```
 
-会打印图层树，并自动标出「匹配到的门店 Logo 图层」（图层名 == Excel 门店名）以及
+会打印图层树，并自动标出「匹配到的门店 Logo 图层」（图层名与 Excel 门店名「模糊包含」匹配）以及
 「品牌 Logo 图层」（名字含 logo，每张都显示）。如果名字对不上，按下面「PSD 模板规范」改脚本顶部的映射常量即可。
 
 ### 2. 先合成一行做测试
@@ -79,6 +79,42 @@ python psd_cover_batch.py --psd 8081.psd --xlsx 门店销售0803销售顾问.xls
 ```
 
 每一行数据导出一张 PNG，命名格式：`001_易田电器_刘超.png`。
+
+---
+
+## 图形界面版（GUI）
+
+除命令行脚本外，仓库还附带带图形界面的「七方视频封面批量制作」程序（`qifang_cover_maker.py`），
+功能与命令行版一致（模糊包含匹配门店 Logo + 品牌 Logo 常显 + 姓名不缩放），但用窗口勾选配置，更适合日常使用：
+
+- 三个标签页：**文件与字段 / 门店 Logo 映射 / 生成**
+- 自动识别门店 Logo（模糊包含匹配）与品牌 Logo（名字含 `logo` 的图层每张都显示）
+- 配置（门店→Logo 映射、文字图层名等）自动保存到同目录 `qifang_cover_config.json`
+
+### 直接用 exe（推荐）
+
+从 GitHub Releases 下载 `qifang_cover_maker.exe`，双击即可使用（仍需本机安装 Photoshop）。
+
+### 从源码运行 / 打包（注意 tkinter）
+
+GUI 依赖 `tkinter`，**打包或运行所用的 Python 必须自带 tkinter**（如系统 Python 3.14）。
+托管 Python 3.13 默认不含 tkinter，会报 `ModuleNotFoundError: No module named 'tkinter'`。
+
+```bash
+# 用系统 Python 3.14 建 venv（自带 tkinter 8.6）
+python3.14 -m venv venv314
+venv314\Scripts\python.exe -m pip install --no-cache-dir pywin32 openpyxl pyinstaller
+
+# 直接跑源码
+venv314\Scripts\python.exe qifang_cover_maker.py
+
+# 打包成单文件 exe（windowed 无控制台）
+venv314\Scripts\python.exe -m PyInstaller --onefile --windowed --name "七方视频封面批量制作" ^
+  --hidden-import win32com --hidden-import win32com.client --hidden-import pythoncom ^
+  --hidden-import openpyxl qifang_cover_maker.py
+```
+
+> 安装依赖时**不要** `pip install --upgrade pip`，否则部分沙箱环境会因删除旧包触发安全拦截导致失败；用 `--no-cache-dir` 即可。
 
 ---
 
