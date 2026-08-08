@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 用户资产（PSD 模板 / Excel 数据源请自行保管，不要提交）
+*.psd
+*.psd拷贝*
+*.xlsx
+*.xls
+
+# 生成产物
+/out/
+/out_test/
+build/
+dist/
+*.exe
+
+# 系统
+.DS_Store
+Thumbs.db
