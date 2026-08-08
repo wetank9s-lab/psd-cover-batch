@@ -251,6 +251,29 @@ def test_store_in_column_z_and_aa(tmp_path):
     assert ds.headers[26] == "姓名"
 
 
+def test_store_in_column_aa(tmp_path):
+    # 验收第 6 项：store 独立位于 AA 列（col_store=26）。
+    # 注意：Z 列放不同数据（不可与 AA 相同），防止误取。
+    header = [f"C{i}" for i in range(27)]      # A..Z, AA = 26 列
+    header[25] = "Z门店"                        # Z 列放干扰数据
+    header[26] = "门店"                         # AA 列才是门店
+    rows = [header]
+    for i, (z_val, aa_val) in enumerate([("Z甲", "A门店"), ("Z乙", "B门店")], start=1):
+        data = [f"x{i}-{j}" for j in range(27)]
+        data[0] = i                            # A 列编号（与门店不同）
+        data[25] = z_val                       # Z 列：干扰值，绝不等于 AA
+        data[26] = aa_val                      # AA 列：真实门店
+        rows.append(data)
+    p = _make_xlsx(tmp_path, rows)
+    ds = load_excel_dataset(p, col_store=26, col_name=1, col_phone=3,
+                            require_phone=False)
+    # store 来自 AA 列（26），不是 Z（25）
+    assert ds.stores == ["A门店", "B门店"]
+    assert [r.store for r in ds.valid_rows] == ["A门店", "B门店"]
+    assert [r.values[25] for r in ds.valid_rows] == ["Z甲", "Z乙"]   # Z 列是干扰值
+    assert [r.values[26] for r in ds.valid_rows] == ["A门店", "B门店"]  # AA 列真实来源
+
+
 def test_stores_strip_order_dedup(tmp_path):
     p = _make_xlsx(tmp_path, [
         ["门店", "姓名", "职位", "电话"],
@@ -353,15 +376,26 @@ def test_error_column_conflict_store_name(tmp_path):
 
 
 def test_xlsm_supported(tmp_path):
-    p = tmp_path / "data.xlsm"
+    # 验收第 34 项：.xlsm 由 pytest 独立真实创建 + 读取（非 suffix 检查，不依赖仓库固定文件）。
+    # 内容对齐 stage4_blk_g.py：sheet / stores / valid_rows / values 全量断言。
+    p = tmp_path / "macro.xlsm"
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append(["门店", "姓名", "职位", "电话"])
-    ws.append(["易田电器", "王兵", "销售顾问", 13800000001])
+    ws.title = "门店数据"
+    ws.append(["编号", "门店", "姓名", "电话", "销售顾问"])
+    ws.append([1, "康乐电器", "张三", 13800000001, "王顾问"])
+    ws.append([2, "美的专卖", "李四", 13800000002, "陈顾问"])
     wb.save(p)
-    ds = load_excel_dataset(str(p))
-    assert ds.valid_rows[0].phone == "13800000001"
-    assert ds.sheet_name == "Sheet"
+    wb.close()
+    ds = load_excel_dataset(str(p), has_header=True,
+                            col_store=1, col_name=2, col_phone=3, col_role=4)
+    assert ds.sheet_name == "门店数据"
+    assert ds.stores == ["康乐电器", "美的专卖"]
+    assert len(ds.valid_rows) == 2
+    r0 = ds.valid_rows[0]
+    assert (r0.store, r0.name, r0.phone, r0.role) == \
+        ("康乐电器", "张三", "13800000001", "王顾问")
+    assert r0.values[0] == "1" and r0.values[1] == "康乐电器"   # values 为 str 形式
 
 
 # ---------------------------------------------------------------------------
