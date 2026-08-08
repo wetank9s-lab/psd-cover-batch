@@ -14,6 +14,7 @@ import sys
 import json
 import time
 import threading
+import subprocess
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -21,6 +22,50 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import win32com.client
 import pythoncom
 import openpyxl
+
+# ---------------- Photoshop 资源管理 ----------------
+# 关键问题：Photoshop 一旦被 COM 拉起，若不及时退出会一直驻留内存（数百 MB~数 GB）
+# 并占用暂存盘（scratch）。因此记录是否「由本程序拉起」，用完即关闭所有文档并退出 PS，
+# 把内存和磁盘（暂存文件）及时释放；若 PS 原本就在运行（用户自己开的），则不打扰。
+_PS_LAUNCHED_BY_US = False
+
+
+def _ps_is_running():
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Photoshop.exe"],
+                             capture_output=True, text=True).stdout
+        return "Photoshop.exe" in out
+    except Exception:
+        return False
+
+
+def ps_launch():
+    """连接（必要时拉起）Photoshop；若拉起前未运行，则标记为「本程序拉起」。"""
+    global _PS_LAUNCHED_BY_US
+    was = _ps_is_running()
+    app = win32com.client.Dispatch("Photoshop.Application")
+    app.DisplayDialogs = 3  # psDisplayNoDialogs
+    if not was:
+        _PS_LAUNCHED_BY_US = True
+    return app
+
+
+def ps_cleanup(app, quit_app=False):
+    """关闭所有打开的文档（不保存），并可选退出 Photoshop 以释放内存与暂存盘。"""
+    if app is None:
+        return
+    # 关闭所有残留文档（包括意外残留的「未标题-N」）
+    try:
+        while app.Documents.Count > 0:
+            app.Documents.Item(1).Close(2)  # psDoNotSaveChanges
+    except Exception:
+        pass
+    if quit_app and _PS_LAUNCHED_BY_US:
+        try:
+            app.Quit()
+        except Exception:
+            pass
+
 
 APP_TITLE = "七方视频封面批量制作"
 CONFIG_NAME = "qifang_cover_config.json"
@@ -253,6 +298,7 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
       fmt, also_png(bool)
     """
     pythoncom.CoInitialize()
+    app = None
     try:
         # ---- 读取 Excel ----
         wb = openpyxl.load_workbook(cfg["xlsx_path"], data_only=True)
@@ -276,8 +322,7 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
 
         # ---- 连接 Photoshop ----
         log_cb("正在启动 / 连接 Photoshop ...")
-        app = win32com.client.Dispatch("Photoshop.Application")
-        app.DisplayDialogs = 3  # psDisplayNoDialogs
+        app = ps_launch()
         doc0 = app.Open(cfg["psd_path"])
         time.sleep(0.6)
 
@@ -373,6 +418,7 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
         import traceback
         log_cb(traceback.format_exc())
     finally:
+        ps_cleanup(app, quit_app=True)
         pythoncom.CoUninitialize()
 
 
@@ -655,19 +701,23 @@ class App:
         try:
             self._log_gui(f"正在用 Photoshop 解析 PSD 图层：{os.path.basename(psd)}")
             pythoncom.CoInitialize()
-            app = win32com.client.Dispatch("Photoshop.Application")
-            app.DisplayDialogs = 3
+            app = None
+            app = ps_launch()
             doc = app.Open(psd)
             time.sleep(0.6)
             layers = collect_layer_names(doc)  # [(name, is_group, parent_name)]
             self.all_text_layers = collect_text_layer_names(doc)
             doc.Close(2)
+            # PSD 解析完成，立即关闭并退出 Photoshop，释放内存与暂存盘
+            ps_cleanup(app, quit_app=True)
+            app = None
             pythoncom.CoUninitialize()
             self.all_psd_layers = [n for n, _, _ in layers]
             self.all_psd_is_group = {n: g for n, g, _ in layers}
             self.all_psd_parent = {n: p for n, _, p in layers}
         except Exception as e:
             messagebox.showerror("PSD 错误", f"无法解析 PSD（请确认 Photoshop 已安装并可启动）：\n{e}")
+            ps_cleanup(app, quit_app=True)
             try:
                 pythoncom.CoUninitialize()
             except Exception:
@@ -895,6 +945,7 @@ class App:
         # 预览只做第一行：用 col 读取第1行
         try:
             pythoncom.CoInitialize()
+            app = None
             wb = openpyxl.load_workbook(cfg["xlsx_path"], data_only=True)
             ws = wb.active
             rows = list(ws.iter_rows(values_only=True))
@@ -908,8 +959,7 @@ class App:
             if cfg["col_role"] >= 0 and cfg["col_role"] < len(r) and r[cfg["col_role"]] is not None:
                 role = str(r[cfg["col_role"]]).strip()
 
-            app = win32com.client.Dispatch("Photoshop.Application")
-            app.DisplayDialogs = 3
+            app = ps_launch()
             doc0 = app.Open(cfg["psd_path"])
             time.sleep(0.6)
 
@@ -942,6 +992,8 @@ class App:
             export_doc(d, p, FMT_PNG)
             d.Close(2)
             doc0.Close(2)
+            ps_cleanup(app, quit_app=True)
+            app = None
             pythoncom.CoUninitialize()
             self._log_gui(f"预览已生成：{p}")
             try:
@@ -950,6 +1002,7 @@ class App:
                 pass
         except Exception as e:
             self._log_gui(f"预览失败：{e}")
+            ps_cleanup(app, quit_app=True)
             try:
                 pythoncom.CoUninitialize()
             except Exception:
@@ -1023,6 +1076,18 @@ def main():
     except Exception:
         pass
     App(root)
+
+    def _on_exit():
+        # 程序退出时，若 Photoshop 是由本程序拉起的且仍在运行，确保退出以释放内存/暂存盘
+        if _PS_LAUNCHED_BY_US and _ps_is_running():
+            try:
+                a = win32com.client.Dispatch("Photoshop.Application")
+                ps_cleanup(a, quit_app=True)
+            except Exception:
+                pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_exit)
     root.mainloop()
 
 
