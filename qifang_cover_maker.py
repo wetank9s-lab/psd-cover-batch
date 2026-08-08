@@ -43,7 +43,11 @@ from core.logo_mapping import (
 from core.excel_data import (
     ExcelRow, ExcelDataset, SkippedRow, ExcelDataError,
     load_excel_dataset, index_to_excel_column, excel_column_to_index,
-    resolve_group_subdir,
+)
+# Stage 4.5：输出分组核心（output path 范畴；与 Excel 解析解耦）
+from core.output_paths import (
+    OutputPathError, build_group_folder_map, resolve_output_directory,
+    assert_group_column_valid,
 )
 
 # ---------------- Photoshop 资源管理 ----------------
@@ -517,6 +521,21 @@ def export_doc(doc, path, fmt):
     doc.SaveAs(path, opt, True)
 
 
+def _group_plan_summary(folder_map, group_column):
+    """分组配置 -> 日志摘要（批次开始前调用；无分组返回 None）。"""
+    if group_column is None:
+        return None
+    lines = [f"分组字段：{index_to_excel_column(group_column)}",
+             f"预计创建：{folder_map.distinct_folder_count} 个目录"]
+    if folder_map.empty_group_count:
+        lines.append(f"空值：{folder_map.empty_group_count} 条 → {folder_map.fallback}")
+    if folder_map.collision_count:
+        lines.append(f"名称冲突：{folder_map.collision_count} 组，已自动区分")
+        for cl in folder_map.collision_summary():
+            lines.append(f"    {cl}")
+    return "；".join(lines)
+
+
 # ----------------------------------------------------------------------------
 # 与 GUI 解耦的核心批处理逻辑（在 worker 线程调用）
 # ----------------------------------------------------------------------------
@@ -573,6 +592,21 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
 
             out_dir = cfg["out_dir"]
             os.makedirs(out_dir, exist_ok=True)
+            # Stage 4.5：分组功能启用时，批次开始前 Preflight 校验分组列有效性
+            group_enabled = bool(cfg.get("group_output_enabled"))
+            group_column = cfg.get("group_output_column")
+            if group_enabled:
+                try:
+                    assert_group_column_valid(dataset.max_columns, True, group_column)
+                except OutputPathError as e:
+                    log_cb(f"分组配置错误：{e}")
+                    return
+                folder_map = build_group_folder_map(data, group_column)
+                summary = _group_plan_summary(folder_map, group_column)
+                if summary:
+                    log_cb(f"[分组计划] {summary}")
+            else:
+                folder_map = None
             # Stage 3：Logo 运行时数据 = LogoMapping（store_logo_map / brand_logo_refs / logo_selection_refs）。
             # 不再在运行时用 name heuristic 判断品牌/门店（brand_logos_for 已废弃）。
             logo_map = _build_logo_mapping(cfg, index)
@@ -639,13 +673,10 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
                     safe_store = core_util.sanitize_filename(store)
                     safe_name = core_util.sanitize_filename(name)
                     base = f"{idx:03d}_{safe_store}_{safe_name}"
-                    # Stage 4.5：按 Excel 任意列分组输出子文件夹（Preview/Batch 同一规则）
-                    row_dir = out_dir
-                    if cfg.get("group_output_enabled") and cfg.get("group_output_column") is not None:
-                        sub = resolve_group_subdir(
-                            r, cfg["group_output_column"], fallback="未分组")
-                        row_dir = os.path.join(out_dir, sub)
-                        os.makedirs(row_dir, exist_ok=True)
+                    # Stage 4.5：唯一目录解析入口（Batch base=out_dir；与 Preview 同一 resolver）
+                    row_dir = resolve_output_directory(
+                        out_dir, r, group_column,
+                        folder_map=folder_map) if group_column is not None else out_dir
                     if fmt == FMT_PSD:
                         p = os.path.join(row_dir, base + ".psd")
                         export_doc(d, p, FMT_PSD)
@@ -1574,6 +1605,15 @@ class App:
         if not cfg["out_dir"]:
             messagebox.showerror("错误", "请先选择输出目录。")
             return
+        # Stage 4.5：Preflight —— 分组功能已启用但分组列无效时，阻止开始
+        if cfg.get("group_output_enabled"):
+            try:
+                assert_group_column_valid(
+                    self.excel_dataset.max_columns if self.excel_dataset is not None else 0,
+                    True, cfg.get("group_output_column"))
+            except OutputPathError as e:
+                messagebox.showerror("分组配置错误", str(e))
+                return
 
         self.running = True
         self.stop_flag.clear()
@@ -1605,10 +1645,12 @@ class App:
            not cfg["xlsx_path"] or not os.path.exists(cfg["xlsx_path"]):
             messagebox.showerror("错误", "请先选择 PSD 与 Excel，并点击【加载】。")
             return
-        tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preview_tmp")
-        os.makedirs(tmp, exist_ok=True)
-        cfg = dict(cfg)
-        cfg["out_dir"] = tmp
+        if not cfg["out_dir"]:
+            messagebox.showerror("错误", "请先选择输出目录（预览将生成在 输出目录/_preview 下，不污染正式输出）。")
+            return
+        # Stage 4.5：Preview 隔离 —— base = out_dir/_preview（与 Batch 同一 resolver，仅 base 不同）
+        preview_base = os.path.join(cfg["out_dir"], "_preview")
+        os.makedirs(preview_base, exist_ok=True)
         self._log_gui("生成预览（第1行数据）...")
         # 预览只做第一行（Stage 4：统一入口 load_excel_dataset，用 valid_rows[0]）
         try:
@@ -1624,6 +1666,19 @@ class App:
                 self._log_gui("Excel 中没有可生成的有效数据。")
                 return
             r = ds.valid_rows[0]
+            # Stage 4.5：Preflight —— 分组功能已启用但分组列无效时，阻止 Preview
+            group_enabled = bool(cfg.get("group_output_enabled"))
+            group_column = cfg.get("group_output_column")
+            if group_enabled:
+                try:
+                    assert_group_column_valid(ds.max_columns, True, group_column)
+                except OutputPathError as e:
+                    messagebox.showerror("分组配置错误", str(e))
+                    return
+                # 用整批数据建 map：Preview 目录与 Batch 完全一致（碰撞后缀相同）
+                folder_map = build_group_folder_map(ds.valid_rows, group_column)
+            else:
+                folder_map = None
             store = r.store
             name = r.name
             phone_s = r.phone
@@ -1671,14 +1726,12 @@ class App:
                         if ok:
                             applied[ref.id] = visible
                     _verify_applied_visibility(d, index, plan, applied, self._log_gui)
-                    # Stage 4.5：预览与 Batch 使用同一分组目录解析规则
-                    p_dir = tmp
-                    if cfg.get("group_output_enabled") and cfg.get("group_output_column") is not None:
-                        sub = resolve_group_subdir(
-                            r, cfg["group_output_column"], fallback="未分组")
-                        p_dir = os.path.join(tmp, sub)
-                        os.makedirs(p_dir, exist_ok=True)
-                    p = os.path.join(p_dir, "preview.png")
+                    # Stage 4.5：与 Batch 共用同一 resolver（resolve_output_directory），
+                    # 仅 base 不同（preview_base = out_dir/_preview），禁止污染正式目录
+                    p_dir = resolve_output_directory(
+                        preview_base, r, group_column,
+                        folder_map=folder_map) if group_column is not None else preview_base
+                    p = os.path.join(p_dir, "preview_" + core_util.sanitize_filename(name) + ".png")
                     export_doc(d, p, FMT_PNG)
                     self._log_gui(f"预览已生成：{p}")
                     try:

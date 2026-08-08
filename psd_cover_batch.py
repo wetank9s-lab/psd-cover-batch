@@ -48,7 +48,12 @@ from core.logo_mapping import (
 # Stage 4：统一 Excel 数据管线（CLI 也统一走 load_excel_dataset）
 from core.excel_data import (
     ExcelRow, ExcelDataset, SkippedRow, ExcelDataError,
-    load_excel_dataset, resolve_group_subdir, excel_column_to_index,
+    load_excel_dataset, excel_column_to_index, index_to_excel_column,
+)
+# Stage 4.5：输出分组核心（与 GUI 共用同一 resolver；CLI 不自建 os.path.join 规则）
+from core.output_paths import (
+    OutputPathError, build_group_folder_map, resolve_output_directory,
+    assert_group_column_valid,
 )
 
 # ============================================================
@@ -224,6 +229,23 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None,
             print(f"Excel 读取完成：{len(data)} 行有效数据，跳过 {len(ds.skipped_rows)} 行"
                   f"（sheet：{ds.sheet_name}）。")
 
+            # Stage 4.5：分组功能启用（--group-output-column 指定）时，
+            # 批次开始前 Preflight 校验 + 建立完整 folder map（与 GUI 同一核心）
+            folder_map = None
+            if group_output_column is not None:
+                try:
+                    assert_group_column_valid(ds.max_columns, True, group_output_column)
+                    folder_map = build_group_folder_map(data, group_output_column)
+                except OutputPathError as e:
+                    print(f"[分组配置错误] {e}")
+                    return
+                print(f"分组字段：{index_to_excel_column(group_output_column)}，"
+                      f"预计创建 {folder_map.distinct_folder_count} 个目录"
+                      + (f"，空值 {folder_map.empty_group_count} 条 → {folder_map.fallback}"
+                         if folder_map.empty_group_count else "")
+                      + (f"，名称冲突 {folder_map.collision_count} 组，已自动区分"
+                         if folder_map.collision_count else ""))
+
             # Stage 3：Logo 运行时数据 = LogoMapping（store_logo_map / brand_logo_refs）。
             # 名称启发式只用于「首次自动推荐」（match_store_logo / suggest_brand_logos），
             # 运行时不再 fuzzy / name guessing。
@@ -328,12 +350,10 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None,
                 print(f"  门店 Logo: {store!r} -> {shown}")
 
                 fname = f"{idx + 1:03d}_{sanitize(store)}_{sanitize(name)}.png"
-                # Stage 4.5：按 Excel 任意列分组输出子文件夹（与 GUI 同一规则）
-                row_dir = out_dir
-                if group_output_column is not None:
-                    sub = resolve_group_subdir(r, group_output_column, fallback="未分组")
-                    row_dir = os.path.join(out_dir, sub)
-                    os.makedirs(row_dir, exist_ok=True)
+                # Stage 4.5：与 GUI 共用同一 resolver（resolve_output_directory +
+                # 批次前建好的 folder_map），CLI 不再自行 os.path.join(out, sanitized)
+                row_dir = out_dir if group_output_column is None else resolve_output_directory(
+                    out_dir, r, group_output_column, folder_map=folder_map)
                 out_path = os.path.join(row_dir, fname)
                 opts = win32com.client.Dispatch("Photoshop.PNGSaveOptions")
                 opts.Interlaced = False

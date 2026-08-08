@@ -434,38 +434,9 @@ def load_excel_dataset(
 
 
 # ---------------------------------------------------------------------------
-# Stage 4.5：按 Excel 任意列分组输出子文件夹
+# 输出分组：Stage 4.5 已迁至 core/output_paths.py
 # ---------------------------------------------------------------------------
-def group_dir_name(group_value: Any, fallback: str = "未分组") -> str:
-    """把任意 Excel 单元格值清洗为安全的子目录名（Windows 可用）。
-
-    - 空值（None / 空串 / 纯空白）-> fallback（默认「未分组」）；
-    - 复用 util.sanitize_filename 的 Windows 非法字符/保留设备名/截断清洗；
-    - 清洗后为空 -> fallback。
-    """
-    from core.util import sanitize_filename
-    if group_value is None:
-        return fallback
-    s = str(group_value).strip()
-    if not s:
-        return fallback
-    cleaned = sanitize_filename(s, fallback=fallback)
-    return cleaned or fallback
-
-
-def resolve_group_subdir(row: "ExcelRow", group_column: Optional[int],
-                         fallback: str = "未分组") -> str:
-    """由一行 ExcelRow 的 values 计算分组子目录名。
-
-    红线段：分组值必须直接来自 row.values[group_column]（Stage 4 提供的完整规范化行），
-    禁止重新 openpyxl / 禁止重新访问 Workbook / Worksheet / Cell。
-    - group_column 为 None / 越界 -> fallback（视为未启用或配置错误）；
-    - 否则取 row.values[group_column] 清洗为目录名。
-    """
-    if group_column is None:
-        return fallback
-    if row is None:
-        return fallback
-    if not (0 <= group_column < len(row.values)):
-        return fallback
-    return group_dir_name(row.values[group_column], fallback=fallback)
+# Excel 任意列分组输出（GroupFolderMap / resolve_output_directory /
+# sanitize_group_component / OutputPathError）属于 output path 范畴，
+# 统一放在 core/output_paths.py，避免本文件变成万能工具文件。
+# ExcelRow.values 仍是分组值的唯一数据源（红线不变）。
