@@ -49,6 +49,10 @@ from core.output_paths import (
     OutputPathError, build_group_folder_map, resolve_output_directory,
     assert_group_column_valid,
 )
+# Stage 5：统一 Renderer（Preview / Batch / CLI 共用 render_one）
+from core.renderer import (
+    render_one, run_batch as renderer_run_batch,
+)
 
 # ---------------- Photoshop 资源管理 ----------------
 # Stage 1 起由 core.photoshop.PhotoshopSession 统一管理：
@@ -616,91 +620,43 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
                 return
             fmt = cfg["fmt"]
             also_png = cfg["also_png"]
-            col_role = cfg["col_role"]
 
+            # ---- Stage 5：统一 Renderer（render_one/run_batch 收敛全部单行逻辑）----
+            # Batch 只负责：打开模板 → 建 index / logo_map / folder_map → 调 renderer_run_batch
+            # 汇总 BatchResult → 按 RowResult 展示成功/失败/跳过。不再自行
+            # Duplicate / 替换文字 / Logo / SaveAs / Close。
             total = len(data)
-            done = 0
             t0 = time.time()
-            for idx, r in enumerate(data, start=1):
-                if stop_flag.is_set():
-                    log_cb("用户已停止。")
-                    break
-                # Stage 4：r 已是 ExcelRow（load_excel_dataset 统一解析）
-                store = r.store
-                name = r.name
-                phone_s = r.phone
-                role = r.role if col_role >= 0 else None
-
-                d = None
-                try:
-                    d = ps.duplicate_document(doc0)
-                    app.ActiveDocument = d
-                    time.sleep(0.05)
-
-                    # Stage 2：按 LayerRef 精确定位（同 LayerRef 在 duplicate 上重新 resolve，
-                    # 绝不把 template 的 COM layer 拿去操作 duplicate）
-                    if name_ref:
-                        set_text_by_ref(d, index, name_ref, name, log_cb, label="姓名")
-                    # 电话
-                    if phone_ref:
-                        set_text_by_ref(d, index, phone_ref, phone_s, log_cb, label="电话")
-                    # 销售顾问（仅当 Excel 该列有值）
-                    if role_ref and role is not None:
-                        set_text_by_ref(d, index, role_ref, role, log_cb, label="销售顾问")
-
-                    # Stage 3：Logo 可见性 = 纯计划（prepare_logo_visibility）→ 逐项写 Visible。
-                    # 运行时不再 fuzzy / name guessing；无映射门店直接报错（不静默保留模板原 Logo）。
-                    try:
-                        plan = prepare_logo_visibility(
-                            store, logo_map, require_store_mapping=True,
-                            effective_leaf_refs=getattr(logo_map, "_effective_leaf_refs", None))
-                    except LogoVisibilityError as e:
-                        log_cb(f"  [Logo错误] {e}")
-                        raise
-                    applied = {}
-                    for ref, visible in plan:
-                        ok, status = set_visible_by_ref(d, index, ref, visible,
-                                                         log_cb, label=ref.display_path)
-                        if ok:
-                            applied[ref.id] = visible
-                    # 写后 read-back 校验：不一致不能静默成功
-                    try:
-                        _verify_applied_visibility(d, index, plan, applied, log_cb)
-                    except LogoVisibilityError as e:
-                        log_cb(f"  [Logo校验失败] {e}")
-                        raise
-
-                    safe_store = core_util.sanitize_filename(store)
-                    safe_name = core_util.sanitize_filename(name)
-                    base = f"{idx:03d}_{safe_store}_{safe_name}"
-                    # Stage 4.5：唯一目录解析入口（Batch base=out_dir；与 Preview 同一 resolver）
-                    row_dir = resolve_output_directory(
-                        out_dir, r, group_column,
-                        folder_map=folder_map) if group_column is not None else out_dir
-                    if fmt == FMT_PSD:
-                        p = os.path.join(row_dir, base + ".psd")
-                        export_doc(d, p, FMT_PSD)
-                        if also_png:
-                            export_doc(d, os.path.join(row_dir, base + ".png"), FMT_PNG)
-                    else:
-                        p = os.path.join(row_dir, base + "." + fmt.lower())
-                        export_doc(d, p, fmt)
-
-                    done += 1
-                    if done % 5 == 0 or done == total:
-                        el = time.time() - t0
-                        progress_cb(done, total)
-                        log_cb(f"  已生成 {done}/{total}  （{el:.1f}s）")
-                finally:
-                    # 无论本行成功/失败，都关闭本工具创建的 duplicate，绝不波及用户文档
-                    if d is not None:
-                        try:
-                            ps.close_owned_document(d)
-                        except Exception as e:
-                            log_cb(f"  警告：关闭副本失败：{e}")
-
+            br = renderer_run_batch(
+                ps_session=ps,
+                template_doc=doc0,
+                rows=data,
+                config={
+                    "fmt": fmt,
+                    "also_png": also_png,
+                    "text_map": cfg.get("text_map", {}),
+                    "group_output_enabled": group_enabled,
+                    "group_output_column": group_column,
+                },
+                layer_index=index,
+                logo_mapping=logo_map,
+                out_dir=out_dir,
+                folder_map=folder_map,
+                cancel_event=stop_flag,
+                progress_cb=progress_cb,
+                log=log_cb,
+                com_dispatch=win32com.client.Dispatch,
+            )
             el = time.time() - t0
-            log_cb(f"完成！共生成 {done} 张，耗时 {el:.1f}s。输出目录：{out_dir}")
+            log_cb(
+                f"完成！成功 {br.success} 张，失败 {br.failed} 张"
+                + (f"，跳过 {br.skipped} 张" if br.skipped else "")
+                + (f"，用户已停止（剩余 {total - len(br.rows)} 张未处理）" if br.cancelled else "")
+                + f"，耗时 {el:.1f}s。输出目录：{out_dir}")
+            # 部分失败明细（GUI 展示失败行错误，供用户定位）
+            for r in br.rows:
+                if r.failed:
+                    log_cb(f"  [失败 行{r.excel_row}] {'；'.join(r.errors)}")
     except Exception as e:
         log_cb(f"错误：{e}")
         import traceback
@@ -1679,72 +1635,58 @@ class App:
                 folder_map = build_group_folder_map(ds.valid_rows, group_column)
             else:
                 folder_map = None
-            store = r.store
-            name = r.name
-            phone_s = r.phone
-            role = r.role
 
             with PhotoshopSession() as ps:
-                app = ps.app
                 doc0 = ps.open_document(cfg["psd_path"])
                 time.sleep(0.6)
 
                 # Stage 2：运行时 LayerIndex
                 index = collect_layer_index(doc0)
 
-                text_map = cfg.get("text_map", {})
-                name_ref = text_map.get("姓名", "")
-                phone_ref = text_map.get("电话", "")
-                role_ref = text_map.get("销售顾问", "")
+                # Stage 3：Logo 运行时数据（与 Batch 同一构造/校验）
+                logo_map = _build_logo_mapping(cfg, index)
+                logo_err = _validate_runtime_logo(logo_map, index, self._log_gui)
+                if logo_err:
+                    raise LogoVisibilityError(logo_err)
 
-                d = None
+                # ---- Stage 5：Preview 只调 render_one(preview=True) ----
+                # 只负责 ensure fresh/取首行/建 folder map/打开文件/按 RowResult 显示错误。
+                # 不再自行 Duplicate / 替换文字 / Logo / SaveAs / Close。
+                res = render_one(
+                    ps_session=ps,
+                    template_doc=doc0,
+                    row=r,
+                    config={
+                        "fmt": cfg.get("fmt", FMT_PNG),
+                        "also_png": bool(cfg.get("also_png")),
+                        "text_map": cfg.get("text_map", {}),
+                        "group_output_enabled": group_enabled,
+                        "group_output_column": group_column,
+                    },
+                    layer_index=index,
+                    logo_mapping=logo_map,
+                    output_context={
+                        "base_dir": preview_base,
+                        "folder_map": folder_map,
+                    },
+                    index=1,
+                    preview=True,
+                    com_dispatch=win32com.client.Dispatch,
+                    log=self._log_gui,
+                )
+                if res.failed:
+                    for e in res.errors:
+                        self._log_gui(f"预览失败：{e}")
+                    return
+                if not res.output_paths:
+                    self._log_gui("预览失败：未生成任何输出文件。")
+                    return
+                p = res.output_paths[0]
+                self._log_gui(f"预览已生成：{p}")
                 try:
-                    d = ps.duplicate_document(doc0)
-                    app.ActiveDocument = d
-                    time.sleep(0.05)
-
-                    # Stage 2：按 LayerRef 精确 resolve（duplicate 上重新定位）
-                    if name_ref:
-                        set_text_by_ref(d, index, name_ref, name, self._log_gui, label="姓名")
-                    if phone_ref:
-                        set_text_by_ref(d, index, phone_ref, phone_s, self._log_gui, label="电话")
-                    if role_ref and role is not None:
-                        set_text_by_ref(d, index, role_ref, role, self._log_gui, label="销售顾问")
-
-                    # Stage 3：Logo 可见性计划（同 run_batch）
-                    logo_map = _build_logo_mapping(cfg, index)
-                    logo_err = _validate_runtime_logo(logo_map, index, self._log_gui)
-                    if logo_err:
-                        raise LogoVisibilityError(logo_err)
-                    plan = prepare_logo_visibility(
-                        store, logo_map, require_store_mapping=True,
-                        effective_leaf_refs=getattr(logo_map, "_effective_leaf_refs", None))
-                    applied = {}
-                    for ref, visible in plan:
-                        ok, status = set_visible_by_ref(d, index, ref, visible,
-                                                        self._log_gui, label=ref.display_path)
-                        if ok:
-                            applied[ref.id] = visible
-                    _verify_applied_visibility(d, index, plan, applied, self._log_gui)
-                    # Stage 4.5：与 Batch 共用同一 resolver（resolve_output_directory），
-                    # 仅 base 不同（preview_base = out_dir/_preview），禁止污染正式目录
-                    p_dir = resolve_output_directory(
-                        preview_base, r, group_column,
-                        folder_map=folder_map) if group_column is not None else preview_base
-                    p = os.path.join(p_dir, "preview_" + core_util.sanitize_filename(name) + ".png")
-                    export_doc(d, p, FMT_PNG)
-                    self._log_gui(f"预览已生成：{p}")
-                    try:
-                        os.startfile(p)
-                    except Exception:
-                        pass
-                finally:
-                    # 无论预览成败，都关闭本工具创建的 duplicate，绝不波及用户文档
-                    if d is not None:
-                        try:
-                            ps.close_owned_document(d)
-                        except Exception as e:
-                            self._log_gui(f"  警告：关闭预览副本失败：{e}")
+                    os.startfile(p)
+                except Exception:
+                    pass
         except Exception as e:
             self._log_gui(f"预览失败：{e}")
 

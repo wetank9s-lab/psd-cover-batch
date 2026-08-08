@@ -55,6 +55,10 @@ from core.output_paths import (
     OutputPathError, build_group_folder_map, resolve_output_directory,
     assert_group_column_valid,
 )
+# Stage 5：统一 Renderer（CLI 渲染循环收敛到 run_batch）
+from core.renderer import (
+    run_batch as renderer_run_batch,
+)
 
 # ============================================================
 # PSD 图层名映射（按你的模板修改这里）
@@ -300,68 +304,46 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None,
                     print(f"  [警告] 文字层 {legacy!r} 无法唯一解析（{status}），该字段将不替换")
 
             todo = [row - 1] if row else list(range(len(data)))
-            exported = 0
-            for idx in todo:
-                if idx < 0 or idx >= len(data):
-                    print(f"[跳过] 行号越界: {idx + 1}")
-                    continue
-                # Stage 4：r 已是 ExcelRow（load_excel_dataset 统一解析）
-                r = data[idx]
-                store = r.store
-                name = r.name
-                title = r.role or ""
-                phone = r.phone
+            # 仅渲染指定行（--row）时，仍使用整批建好的 folder_map（碰撞后缀与全量一致）
+            selected = [data[i] for i in todo if 0 <= i < len(data)]
+            for i in todo:
+                if i < 0 or i >= len(data):
+                    print(f"[跳过] 行号越界: {i + 1}")
 
-                print(f"\n[{idx + 1}/{len(data)}] 门店={store!r} 姓名={name!r} 电话={phone!r}")
-                set_text_ref(index, doc, text_refs.get("姓名"), name, label=NAME_LAYER)
-                set_text_ref(index, doc, text_refs.get("电话"), phone, label=PHONE_LAYER)
-                set_text_ref(index, doc, text_refs.get("销售顾问"), title, label=TITLE_LAYER)
-
-                # Stage 3：Logo 可见性 = 纯计划（prepare_logo_visibility）→ 逐项写 Visible。
-                # 无映射门店直接报错（不静默保留模板原 Logo）；effective 中未被使用的候选
-                # 叶子也隐藏（绝不保留模板原状态）。
-                try:
-                    plan = prepare_logo_visibility(store, logo_map, require_store_mapping=True,
-                                                   effective_leaf_refs=eff)
-                except LogoVisibilityError as e:
-                    print(f"  [Logo错误] {e}")
-                    return
-                applied = {}
-                for rr, visible in plan:
-                    try:
-                        layer = resolve_layer(doc, rr)
-                        layer.Visible = visible
-                        applied[rr.id] = visible
-                    except Exception as e:
-                        print(f"  [警告] 定位 Logo {rr.display_path!r} 失败: {e}")
-                # 写后 read-back 校验
-                try:
-                    readback = {}
-                    for rr, _v in plan:
-                        try:
-                            readback[rr.id] = bool(resolve_layer(doc, rr).Visible)
-                        except Exception:
-                            readback[rr.id] = applied.get(rr.id)
-                    verify_logo_visibility(readback, plan)
-                except LogoVisibilityError as e:
-                    print(f"  [Logo校验失败] {e}")
-                    return
-                shown = [r.display_path for r, v in plan if v]
-                print(f"  门店 Logo: {store!r} -> {shown}")
-
-                fname = f"{idx + 1:03d}_{sanitize(store)}_{sanitize(name)}.png"
-                # Stage 4.5：与 GUI 共用同一 resolver（resolve_output_directory +
-                # 批次前建好的 folder_map），CLI 不再自行 os.path.join(out, sanitized)
-                row_dir = out_dir if group_output_column is None else resolve_output_directory(
-                    out_dir, r, group_output_column, folder_map=folder_map)
-                out_path = os.path.join(row_dir, fname)
-                opts = win32com.client.Dispatch("Photoshop.PNGSaveOptions")
-                opts.Interlaced = False
-                com_call(doc.SaveAs, out_path, opts, True)  # asCopy=True，不改动原 PSD
-                print(f"  已导出 -> {out_path}")
-                exported += 1
-            # with 退出：Session 只关闭自己打开的 doc（模板）
-            print(f"\n完成：共导出 {exported} 张 PNG 到 {out_dir}")
+            # ---- Stage 5：统一 Renderer（run_batch 收敛单行渲染）----
+            # CLI 只负责：打开模板 → 建 index / logo_map / folder_map → 调 renderer_run_batch
+            # 汇总 BatchResult 输出。不再自行 Duplicate / 替换文字 / Logo / SaveAs / Close。
+            import threading
+            br = renderer_run_batch(
+                ps_session=ps,
+                template_doc=doc,
+                rows=selected,
+                config={
+                    "fmt": "PNG",
+                    "also_png": False,
+                    "text_map": text_refs,
+                    "group_output_enabled": group_output_column is not None,
+                    "group_output_column": group_output_column,
+                },
+                layer_index=index,
+                logo_mapping=logo_map,
+                out_dir=out_dir,
+                folder_map=folder_map,
+                cancel_event=threading.Event(),   # CLI 无 UI 停止按钮；预留接口
+                log=print,
+                com_dispatch=win32com.client.Dispatch,
+            )
+            for r in br.rows:
+                if r.success:
+                    for p in r.output_paths:
+                        print(f"  已导出 -> {p}")
+                else:
+                    for e in r.errors:
+                        print(f"  [失败 行{r.excel_row}] {e}")
+            print(f"\n完成：成功 {br.success} 张，失败 {br.failed} 张"
+                  + (f"，跳过 {br.skipped} 张" if br.skipped else "")
+                  + (f"，用户已停止" if br.cancelled else "")
+                  + f"，共导出 {br.success} 张到 {out_dir}")
 
 
 def main():
