@@ -1,0 +1,218 @@
+# Stage 6 完成报告：GUI Worker / Queue / AppState 状态机
+
+**项目**：psd-cover-batch（七方视频封面批量制作）
+**基线**：v1.1.0（Stage 5 正式 PASS 稳定基线）
+**日期**：2026-08-08
+**状态**：✅ Stage 6 全部 38 项完成，等待验收。**未 push**（HEAD 停在 `68f04d5`）。
+
+---
+
+## 一、修改文件清单
+
+| 文件 | 变更 | 说明 |
+|---|---|---|
+| `qifang_cover_maker.py` | 修改（+354/-265） | App 集成状态机 + 全部长任务 worker 化 |
+| `core/task_events.py` | **新增**（190 行） | AppState 枚举 / 转换表 / 事件 dataclass |
+| `core/app_state.py` | **新增**（80 行） | StateControls 控件规则集中管理 |
+| `core/worker_base.py` | **新增**（118 行） | 单 worker 约束 / 事件队列 / 安全生命周期 |
+| `gui_workers.py` | **新增**（382 行） | Load / Preview / Batch 三个 worker |
+| `tests/test_gui_state.py` | **新增**（566 行） | AppState + GUI 状态流转测试（30 项） |
+| `tests/test_worker_events.py` | **新增**（649 行） | worker/queue/事件/快照/关闭测试（45 项） |
+| `stage6_test.spec` | **新增**（44 行） | 打包测试 EXE 用 spec（不正式发布） |
+
+`core/renderer.py`、`core/photoshop.py`、`core/layer_index.py`、`core/excel_data.py`、`core/logo_mapping.py`、`core/output_paths.py` **未修改**（v1.1.0 基线，Stage 6 只做线程重构不改渲染逻辑）。
+
+---
+
+## 二、AppState 状态机（#1-#7）
+
+7 个状态：`IDLE / LOADING / READY / PREVIEWING / RUNNING / STOPPING / ERROR`。
+
+**集中转换表**（`core/task_events.py`，含 2 处 Stage 6 调试期修正）：
+
+| 当前 | 可去 | 不可去 |
+|---|---|---|
+| IDLE | LOADING / READY / ERROR | PREVIEWING / RUNNING / STOPPING |
+| LOADING | READY / ERROR / **IDLE*** | STOPPING / RUNNING |
+| READY | LOADING / PREVIEWING / RUNNING / ERROR / IDLE | STOPPING |
+| PREVIEWING | READY / ERROR | RUNNING / STOPPING / LOADING |
+| RUNNING | READY / STOPPING / ERROR | PREVIEWING / LOADING |
+| STOPPING | READY / ERROR | RUNNING / IDLE |
+| ERROR | READY / IDLE / ERROR | RUNNING |
+
+> *`LOADING→IDLE` 为调试期修正：Load 的 Excel 读取失败路径（fatal=False）会先 ERROR（状态不变）再 WORKER_DONE，`_on_worker_done` 在 layer_index=None 时需回 IDLE 让用户可重试——原表不允许导致**按钮永久禁用卡死**。
+
+非法转换 `transition()` 抛 `ValueError`；GUI 层 `_set_state` 记录日志不崩溃（容忍事件乱序）。
+
+---
+
+## 三、Worker 架构（#8-#17）
+
+### 单一 worker 约束（#6/#8/#12）
+- `WorkerBase` 持有 `_worker_lock` + 单一 `_thread`（**非 daemon**，name=`task-worker`）。
+- `start_task()`：已有 worker 存活 → `raise WorkerAlreadyRunningError`（GUI 入口与 worker 双重兜底）。
+- 测试 `test_start_task_while_alive_raises` 验证。
+
+### Queue 事件模型（#9/#10/#19）
+`queue.Queue[WorkerEvent]`，11 种事件类型（`STATE/LOG/PROGRESS/ROW_STARTED/ROW_FINISHED/LOAD_DONE/PREVIEW_DONE/BATCH_DONE/WORKER_DONE/ERROR/CANCELLED`）。
+
+**payload 红线**（#20/#21/#22）：
+- 只允许 `str/int/float/bool/Path/list/dict/dataclass/None`；
+- **禁止 COM object / Tk widget 入队**（测试 `test_event_payload_must_be_pure_python` 双层检查 + `test_worker_event_payload_never_com_object` 字段类型检查）；
+- Exception 先 string 化（`exception_to_error_payload` → `ErrorPayload`）；
+- `LoadResult` 的 LayerRef 序列化为 dict；`BATCH_DONE` 用 `batch_result_to_summary` 纯 dict。
+
+### 线程隔离保证（#11/#13/#14）
+| 红线 | 保证 |
+|---|---|
+| COM 只在 worker 线程创建/销毁 | 每个任务 `with PhotoshopSession()`（内部 `CoInitializeEx/CoUninitialize`），`com_dispatch=None` → renderer 在 worker 线程内 `Dispatch` |
+| SaveOptions 线程创建 | `_save_option(fmt, com_dispatch)` 每次新建，绝不模块级/实例缓存（Stage 5 CDispatch bug 根因已根治） |
+| worker 不碰 Tk | `gui_workers.py` grep 验证 **0 处** `tk./ttk./messagebox/StringVar/BooleanVar/winfo/config(` |
+| main 不碰 COM | `qifang_cover_maker.py` 中 `PhotoshopSession(` 仅存在于 CLI 遗留函数 `run_batch`（独立线程，v1.1.0 未改） |
+
+### 任务快照（#13/#30）
+- main thread 在启动前收集纯 dict（`_snapshot_for_load` / `_collect_cfg()+_task`）；
+- worker 只读快照，绝不读 Tk variables；
+- 测试 `test_snapshot_is_pure_dict`（JSON 可序列化）+ `test_worker_reads_snapshot_without_tk`。
+
+### Worker 生命周期（#15/#16）
+- `_run_wrapper`：try → 异常兜底 ERROR 事件；finally → **先清 `_thread` 再发 WORKER_DONE**（调试期修正：原顺序导致 GUI 收到 WORKER_DONE 时 `worker_alive` 仍 True，`_maybe_destroy` 检查失败）+ `_worker_done_event.set()`；
+- `wait_worker_done(timeout)` 带超时返回 bool（不无限等）。
+
+---
+
+## 四、Load / Preview / Batch worker（#23-#28）
+
+### Load（#26）
+`TaskWorker._do_load`：Excel（纯 Python）→ PSD（worker 内 COM `collect_layer_index` + `serialize_ref`）→ `LOAD_DONE` 携带纯数据 `LoadResult`。main thread `_on_load_done` 用纯数据重建 `LayerIndex` + 全部 GUI 索引 + 文字下拉 + `_init_logo_checks`（推荐勾选/门店匹配/保存恢复）。
+
+### Preview（#25）
+`_do_preview`：Excel 校验 → 分组 preflight → worker 内 `PhotoshopSession` + `render_one(preview=True)` → `PREVIEW_DONE`。**`os.startfile`（用户可见动作）由 main thread 执行**。
+
+### Batch（#27/#28）
+`_do_batch`：Excel/分组 preflight → worker 内 COM → `renderer_run_batch(...cancel_event, progress_cb, com_dispatch=None)` → `BATCH_DONE`（结构化 summary）+ 完成日志 + 失败行明细。**单行失败 ≠ GUI ERROR**（回 READY，`#24`）。
+
+### 协作取消（#17/#18）
+- `request_stop()`：仅置 `cancel_event`（threading.Event），**不 kill 线程/不 kill Photoshop**；
+- renderer 循环顶部检查点：`if cancel_event.is_set(): break with cancelled=True`；
+- GUI `_stop()`：仅 `RUNNING→STOPPING→READY`（STOPPING 中 Stop 按钮禁用）；
+- 任务间 `cancel_event.clear()`（旧取消不泄漏）。
+
+---
+
+## 五、安全窗口关闭（#29）
+
+```
+_on_exit (WM_DELETE_WINDOW)
+  ├─ worker 未运行 → root.destroy()（立即）
+  └─ worker 运行 → _pending_close=True
+                    request_close()      # closing flag + cancel_event
+                    RUNNING→STOPPING
+                    轮询继续（不 destroy）
+                    → worker 自然退出（WORKER_DONE）
+                    → _on_worker_done → _maybe_destroy → root.destroy()
+```
+
+- 绝不 `kill/terminate/os._exit`；绝不 worker 存活时 destroy；
+- 测试：`test_close_while_idle_destroys_immediately` / `test_close_while_worker_running_waits_for_worker_done` / `test_wait_worker_done_timeout_returns_false` / `test_cleanup_joins_without_kill`。
+
+---
+
+## 六、测试（#30-#36）
+
+### 新增 75 项测试
+
+**tests/test_gui_state.py（30 项）**：AppState 枚举 4 项；转换表 9 项（IDLE/LOADING/READY/PREVIEWING/RUNNING/STOPPING/ERROR/自转换/非法抛 ValueError）；控件规则 9 项（每状态 + 未知回退 + as_dict + 独立实例）；GUI 层状态流转 8 项（`_set_state`/`_on_worker_done`/`_on_load_done`/`_on_preview_done`/`_on_batch_done`/单 worker 约束/worker 复用）。
+
+**tests/test_worker_events.py（45 项）**：事件类型全集 1 项；payload 纯数据红线 2 项；exception string 化 2 项；dataclass 结构 4 项；`batch_result_to_summary` 2 项；WorkerBase 生命周期 7 项（LOG+WORKER_DONE/异常兜底/alive 检查/单 worker/非 daemon/线程分离）；协作取消 3 项；窗口关闭 5 项；快照 2 项；队列 FIFO/轮询 4 项；分发器语义 3 项。
+
+### 覆盖用户指定要求
+| # | 要求 | 测试 |
+|---|---|---|
+| 1 | IDLE 初始 | `test_state_enum_has_all_members` / `test_gui_state_initial_idle` |
+| 2-7 | 状态转换 | `test_transitions_*` 9 项 |
+| 8-9 | STOPPING 控件 | `test_controls_stopping` / `test_gui_state_running_to_stopping_controls` |
+| 10 | LOADING 全禁用 | `test_controls_loading` / `test_gui_state_idle_to_loading_controls` |
+| 11 | ERROR 恢复 | `test_transitions_error` / `test_gui_state_error_then_recover` |
+| 14 | worker alive 拒绝 | `test_gui_state_worker_alive_blocks_second_task` / `test_start_task_while_alive_raises` |
+| 19-21 | Queue 无 COM/Tk、cancel 传 renderer | `test_event_payload_must_be_pure_python` / `test_worker_event_payload_never_com_object` / `test_request_stop_sets_cancel_event_and_worker_stops` |
+| 31 | idle close 立即 | `test_close_while_idle_destroys_immediately` |
+| 36 | worker alive 不 destroy | `test_close_while_worker_running_waits_for_worker_done` |
+
+### 全量回归
+```
+326 passed in 19.83s   # -W error（无警告）
+# 原 251 + 新增 75 = 326；11 个测试文件全绿
+```
+
+> 环境说明：tkinter 测试必须在**系统 Python 3.14 建的 venv**（`py314-tk`）运行——托管 venv（3.13.12）无 tkinter（9 个既有 GUI 测试因此先前失败，换 venv 后全绿）。已记入技能库。
+
+---
+
+## 七、静态 grep 线程审查（#33-#35）
+
+| 模式 | 结果 |
+|---|---|
+| `threading.Thread` / `daemon=` | 仅 `core/worker_base.py:61` 一处，`daemon=False`（非 daemon） |
+| `messagebox.` | 18 处全在 `qifang_cover_maker.py`（main thread） |
+| `StringVar/BooleanVar.set` | 仅 threading.Event（worker_base）；worker 无 Tk 变量 |
+| `Text.insert` | worker 0 处 |
+| `Progressbar` | worker 0 处 |
+| `PhotoshopSession(` | gui_workers 3 处（worker 内）+ core/photoshop（内部）+ qifang CLI 遗留（独立线程） |
+| `Dispatch(` / `GetActiveObject(` | core/photoshop / core/renderer `_default_dispatch`（调用者线程内）+ qifang `export_doc`（调用者线程内，v1.1.0） |
+| `SaveOptions` | renderer `_save_option`（每次新建，不缓存）；qifang `export_doc`（v1.1.0 遗留） |
+| `CDispatch` | 仅注释/文档提及（无跨线程传递） |
+| `queue.` | worker_base `put`（worker 线程）+ qifang:789 `queue.Empty`（main 轮询 get_nowait） |
+| `root.after` | 仅 `_start_polling`/`_poll_worker_events`（main thread） |
+| `root.destroy` | `_maybe_destroy`（条件，worker 退出后）/ `_on_exit` 兜底 / `_rebuild_logo_lists`（widget 子节点，main） |
+
+**结论：全部 12 类模式逐项归属正确线程，无跨线程 Tk/COM 操作。**
+
+---
+
+## 八、打包与真机验收（#37）
+
+### 测试 EXE
+- 按 `pyinstaller-tkinter-build` 技能流程，用 py314-tk venv（带 tkinter）打包 `七方视频封面批量制作_stage6_test.exe`（14,558,118 字节，与 v1.1.0 的 14,458,409 几乎一致）；
+- spec 补 core 包 hiddenimports（`core.task_events` 等 9 子模块 + `gui_workers`）；
+- console 测试版冒烟：**6 秒内未退出（tkinter 打包成功）**；测试产物已归档 `._old_build_artifacts`；
+- **不正式发布**（保留正式版 `七方视频封面批量制作.exe` 不变）。
+
+### 真机验收（真实 Photoshop COM + 老板电器.psd 92MB + 门店销售0803销售顾问.xlsx 221 行）
+
+| 项 | 结果 |
+|---|---|
+| GUI-1 初始 IDLE 控件 | ✅ load=normal preview/run/stop=disabled（**修复**：`__init__` 补 `_apply_controls(IDLE)`） |
+| GUI-2 IDLE→LOADING 全禁用 | ✅ |
+| GUI-3 LOADING→READY 可用 | ✅ |
+| GUI-4 RUNNING→STOPPING→READY | ✅ stop 唯一可用→禁用→恢复 |
+| GUI-5 Load worker | ✅ 35 图层/8 文字层/10 门店/LOAD_DONE 纯数据 |
+| GUI-6 Preview worker | ✅ `preview_刘 超.png` 668KB（worker 内完整 COM 生命周期） |
+| GUI-7 Batch worker | ✅ **221/221 成功，0 失败，186.1s，221 个 PROGRESS 事件，221 PNG** |
+| GUI-8 Stop 协作取消 | ✅ 第 30 张停止 → `cancelled=True`，成功 31 张，26.7s，31 PNG（不 kill） |
+| GUI-9 单 worker 约束 | ✅ 第二任务抛 `WorkerAlreadyRunningError`；完成后可再启动 |
+| GUI-10 安全窗口关闭 | ✅ `request_close` → 等 WORKER_DONE → `_maybe_destroy` destroy |
+| **Preview→Batch CDispatch 回归** | ✅ Preview 后立即 Batch **221/221 成功（185.0s）无 CDispatch 错误** |
+
+> GUI-6/7 需手动补"江华电器→江华家电"映射（模板图层"江华家电"与门店"江华电器"不互含 → NO_MATCH，Stage 5 已记录的**用户操作**，非回归）。
+
+---
+
+## 九、调试期发现并修复的问题（#38 自查）
+
+1. **`LOADING→IDLE` 转换缺失**：Load Excel 失败路径（fatal=False ERROR → WORKER_DONE）导致 `_on_worker_done` 尝试 `LOADING→IDLE` 被拒 → 按钮永久禁用卡死。修复：转换表允许 `LOADING→IDLE`。
+2. **WORKER_DONE 与 `_thread` 清空顺序**：原 finally 先发 WORKER_DONE 再清 `_thread` → GUI 收到事件时 `worker_alive` 仍 True → `_maybe_destroy` 不销毁窗口。修复：先清 `_thread` 再发事件。
+3. **UI 构建后控件未应用 IDLE 规则**：`__init__` 构建 UI 后按钮默认 normal，与状态机不符。修复：`_build_ui()` 后补 `_apply_controls(controls_for(IDLE))`。
+4. **tkinter 8.6 `cget('state')` 返回 Tcl_Obj**：Python 3.14 行为差异，验收脚本断言需 `str()` 转换（非产品 bug）。
+
+---
+
+## 十、Stage 6 完成确认
+
+- ✅ 40 项需求全部落实（线程红线/AppState/单 worker/Load/Preview/Batch/协作取消/安全关闭/36 项测试/静态审查/38 项报告）；
+- ✅ 全量测试 326 项通过（-W error）；
+- ✅ 真实 Photoshop 221 行 Batch 两次全量成功 + Preview→Batch CDispatch 回归 + Stop 取消 + 窗口关闭；
+- ✅ **未 push**（HEAD = `68f04d5`，Stage 5 最后提交），等待验收；
+- ⏭️ 后续：Stage 6.5/7/8、renderer 重构、v1.1.0 回归 **均未启动**（按指令排除）。
+
+**待验收项**：正式 GUI 手动操作（真机点击 Load/Preview/Batch/Stop/关窗）+ 38 项报告核对。

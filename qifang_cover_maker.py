@@ -14,6 +14,7 @@ import sys
 import json
 import time
 import threading
+import queue
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -707,8 +708,22 @@ class App:
         self.running = False
         self.stop_flag = threading.Event()
         self.worker = None
+        # Stage 6：Worker / Queue / AppState
+        from core.task_events import AppState as _AppState
+        from core.worker_base import WorkerAlreadyRunningError
+        from gui_workers import TaskWorker
+        self._AppState = _AppState
+        self._WorkerAlreadyRunningError = WorkerAlreadyRunningError
+        self._state = _AppState.IDLE
+        self._task_worker = TaskWorker()
+        self._worker_polling = False      # 防止重复启动 poll
+        self._pending_close = False       # 窗口关闭请求
+        self._start_polling()
 
         self._build_ui()
+        # 初始状态应用 IDLE 控件规则（UI 构建后控件默认可点，需按状态机收口）
+        from core.app_state import controls_for as _controls_for
+        self._apply_controls(_controls_for(_AppState.IDLE))
         self._load_config()
 
     # ---------------- 路径 ----------------
@@ -718,6 +733,141 @@ class App:
         else:
             base = os.path.dirname(os.path.abspath(__file__))
         return os.path.join(base, CONFIG_NAME)
+
+    # ---------------- Stage 6：状态机 ----------------
+    def _set_state(self, new_state):
+        """集中状态转换：校验 + 更新控件（仅 main thread 调用）。"""
+        from core.app_state import controls_for, transition
+        from core.task_events import is_valid_transition
+        old = self._state
+        if not is_valid_transition(old, new_state):
+            # 非法转换：记录但不崩溃（例如 STOPPING 中收到重复事件）
+            self._log_gui(f"[状态] 忽略非法转换 {old.value}->{new_state.value}")
+            return
+        self._state = new_state
+        self._apply_controls(controls_for(new_state))
+        self._log_gui(f"[状态] {old.value} -> {new_state.value}")
+
+    def _apply_controls(self, c):
+        """把控件规则应用到 widget（仅 main thread）。"""
+        def _set(btn, enabled):
+            if btn is not None:
+                btn.config(state="normal" if enabled else "disabled")
+        # 控件名 -> StateControls 字段名
+        _map = {
+            "btn_load": "load",
+            "btn_preview": "preview",
+            "btn_run": "run",
+            "btn_stop": "stop",
+        }
+        for wname, cname in _map.items():
+            if hasattr(self, wname):
+                _set(getattr(self, wname), getattr(c, cname))
+        # 文件选择 / tab 页
+        for var_btn in (getattr(self, "btn_pick_psd", None),
+                        getattr(self, "btn_pick_xlsx", None),
+                        getattr(self, "btn_pick_out", None)):
+            _set(var_btn, c.pick_files)
+        try:
+            self.notebook.state(["disabled"] if not c.tabs_enabled else ["!disabled"])
+        except Exception:
+            pass
+        # 状态文字
+        if hasattr(self, "status_label"):
+            self.status_label.config(text=f"状态：{c.state_label}")
+
+    def _start_polling(self):
+        """启动事件队列轮询（仅一次）。"""
+        if self._worker_polling:
+            return
+        self._worker_polling = True
+        self.root.after(80, self._poll_worker_events)
+
+    def _poll_worker_events(self):
+        """main thread 轮询 worker 事件队列（Stage 6 #18）。"""
+        q = self._task_worker.event_queue
+        try:
+            while True:
+                ev = q.get_nowait()
+                self._handle_worker_event(ev)
+        except queue.Empty:
+            pass
+        if not self._pending_close or self._task_worker.worker_alive:
+            self.root.after(80, self._poll_worker_events)
+
+    def _handle_worker_event(self, ev):
+        """处理一个 worker 事件（仅 main thread；payload 纯 Python）。"""
+        from core.task_events import WorkerEvent, AppState
+        t = ev.type
+        if t == WorkerEvent.STATE:
+            st = AppState.from_str(ev.payload) if isinstance(ev.payload, str) else ev.payload
+            self._set_state(st)
+        elif t == WorkerEvent.LOG:
+            self._log_gui(ev.payload)
+        elif t == WorkerEvent.PROGRESS:
+            self._update_progress(ev.payload.current, ev.payload.total,
+                                  phase=ev.payload.phase)
+        elif t == WorkerEvent.ROW_STARTED:
+            pass  # 日志已由 renderer 输出；如需可在此显示当前行
+        elif t == WorkerEvent.ROW_FINISHED:
+            pass
+        elif t == WorkerEvent.LOAD_DONE:
+            self._on_load_done(ev.payload)
+        elif t == WorkerEvent.PREVIEW_DONE:
+            self._on_preview_done(ev.payload)
+        elif t == WorkerEvent.BATCH_DONE:
+            self._on_batch_done(ev.payload)
+        elif t == WorkerEvent.CANCELLED:
+            self._log_gui(f"已停止：{ev.payload}")
+        elif t == WorkerEvent.ERROR:
+            p = ev.payload
+            self._log_gui(f"错误（{p.operation}）：{p.message}")
+            if p.fatal:
+                self._set_state(AppState.ERROR)
+        elif t == WorkerEvent.WORKER_DONE:
+            self._on_worker_done()
+
+    def _on_worker_done(self):
+        """worker 正常退出（仅 main thread）。"""
+        from core.task_events import AppState
+        if self._state in (AppState.LOADING,):
+            self._set_state(AppState.READY if self.layer_index is not None else AppState.IDLE)
+        elif self._state in (AppState.RUNNING, AppState.STOPPING):
+            self._set_state(AppState.READY)
+        elif self._state in (AppState.PREVIEWING,):
+            self._set_state(AppState.READY)
+        # 窗口关闭请求且 worker 已退出 -> 允许 destroy
+        self._maybe_destroy()
+
+    def _maybe_destroy(self):
+        """窗口关闭条件：worker 已退出才 destroy（Stage 6 #15）。"""
+        if self._pending_close and not self._task_worker.worker_alive:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+
+    def _snapshot_for_load(self):
+        """Load 任务快照（纯 Python；main thread 收集）。"""
+        return {
+            "psd_path": self.psd_var.get().strip(),
+            "xlsx_path": self.xlsx_var.get().strip(),
+            "has_header": bool(self.header_var.get()),
+            "col_store": self._col_of(self.col_store_var.get()),
+            "col_name": self._col_of(self.col_name_var.get()),
+            "col_phone": self._col_of(self.col_phone_var.get()),
+            "col_role": self._col_of(self.col_role_var.get()),
+        }
+
+    def _snapshot_for_preview(self):
+        cfg = self._collect_cfg()
+        cfg["_task"] = "preview"
+        return cfg
+
+    def _snapshot_for_batch(self):
+        cfg = self._collect_cfg()
+        cfg["_task"] = "batch"
+        return cfg
 
     # ---------------- UI 构建 ----------------
     def _build_ui(self):
@@ -747,17 +897,20 @@ class App:
         ttk.Label(row, text="PSD 模板:").grid(row=0, column=0, sticky="e", pady=3)
         self.psd_var = tk.StringVar()
         ttk.Entry(row, textvariable=self.psd_var, width=55).grid(row=0, column=1, padx=4)
-        ttk.Button(row, text="浏览...", command=self._pick_psd).grid(row=0, column=2)
+        self.btn_pick_psd = ttk.Button(row, text="浏览...", command=self._pick_psd)
+        self.btn_pick_psd.grid(row=0, column=2)
 
         ttk.Label(row, text="Excel 数据:").grid(row=1, column=0, sticky="e", pady=3)
         self.xlsx_var = tk.StringVar()
         ttk.Entry(row, textvariable=self.xlsx_var, width=55).grid(row=1, column=1, padx=4)
-        ttk.Button(row, text="浏览...", command=self._pick_xlsx).grid(row=1, column=2)
+        self.btn_pick_xlsx = ttk.Button(row, text="浏览...", command=self._pick_xlsx)
+        self.btn_pick_xlsx.grid(row=1, column=2)
 
         ttk.Label(row, text="输出目录:").grid(row=2, column=0, sticky="e", pady=3)
         self.out_var = tk.StringVar()
         ttk.Entry(row, textvariable=self.out_var, width=55).grid(row=2, column=1, padx=4)
-        ttk.Button(row, text="浏览...", command=self._pick_out).grid(row=2, column=2)
+        self.btn_pick_out = ttk.Button(row, text="浏览...", command=self._pick_out)
+        self.btn_pick_out.grid(row=2, column=2)
 
         # Stage 4：has_header 默认 True（已有 config 优先，见 _load_config）
         self.header_var = tk.BooleanVar(value=True)
@@ -835,7 +988,8 @@ class App:
         # 加载按钮
         bf = ttk.Frame(parent)
         bf.pack(fill="x", padx=6, pady=6)
-        ttk.Button(bf, text="加载 PSD / Excel 并分析图层", command=self._load).pack(side="left")
+        self.btn_load = ttk.Button(bf, text="加载 PSD / Excel 并分析图层", command=self._load)
+        self.btn_load.pack(side="left")
         ttk.Button(bf, text="保存配置", command=self._save_config).pack(side="left", padx=6)
 
     def _build_tab_logo(self, parent):
@@ -928,6 +1082,12 @@ class App:
         self.btn_stop.pack(side="left", padx=6)
         self.btn_preview = ttk.Button(bf, text="🖼 试做第1张预览", command=self._preview)
         self.btn_preview.pack(side="left", padx=6)
+
+        # 状态文字（Stage 6）
+        sf = ttk.Frame(parent)
+        sf.pack(fill="x", padx=6, pady=4)
+        self.status_label = ttk.Label(sf, text="状态：空闲")
+        self.status_label.pack(side="left")
 
         # 日志
         lf = ttk.LabelFrame(parent, text="运行日志", padding=6)
@@ -1086,6 +1246,8 @@ class App:
         self._log_gui(f"门店映射已按新 Excel 列刷新：{len(stores)} 个门店。")
 
     def _load(self):
+        """Stage 6: Load into worker. main thread only collects snapshot + starts worker."""
+        from core.task_events import AppState
         psd = self.psd_var.get().strip()
         xlsx = self.xlsx_var.get().strip()
         if not psd or not os.path.exists(psd):
@@ -1094,47 +1256,72 @@ class App:
         if not xlsx or not os.path.exists(xlsx):
             messagebox.showerror("错误", "请先选择有效的 Excel 数据文件。")
             return
-
-        # 读取 Excel 门店 + 列头（Stage 4：统一入口 load_excel_dataset，修复 P1-01 ——
-        # 门店不再固定取 A 列，而是按用户配置的 col_store 列读取）
-        if not self._load_excel_data(xlsx):
+        if self._task_worker.worker_alive:
+            messagebox.showwarning("提示", "已有任务正在运行，请稍候。")
             return
-
-        # 读取 PSD 图层（通过 Photoshop COM；Session 负责 COM 初始化并只关闭自己打开的文档）
+        cfg = self._snapshot_for_load()
+        self._set_state(AppState.LOADING)
         try:
-            self._log_gui(f"正在用 Photoshop 解析 PSD 图层：{os.path.basename(psd)}")
-            with PhotoshopSession() as ps:
-                doc = ps.open_document(psd)
-                time.sleep(0.6)
-                # Stage 2：建立唯一 LayerIndex（不丢同名图层），替代旧的按 name 去重
-                self.layer_index = collect_layer_index(doc)
-                self._ref_by_id = {r.id: r for r in self.layer_index.layers}
-                self.layer_labels = self.layer_index.labels()   # id -> 唯一 label
-                # 兼容缓存（旧逻辑仍读取；新建逻辑优先用 layer_index）
-                self.all_psd_layers = [r.name for r in self.layer_index.layers]
-                self.all_psd_is_group = {r.id: r.is_group for r in self.layer_index.layers}
-                self.all_psd_parent = {r.id: self._parent_name_of(r) for r in self.layer_index.layers}
-                self.all_text_layers = [r.display_path for r in self.layer_index.layers if r.is_text]
-                # 文字层 label -> LayerRef（同名 display_path 已由 labels 附加 id 后缀）
-                self.text_label_to_ref = {}
-                for r in self.layer_index.layers:
-                    if r.is_text:
-                        self.text_label_to_ref[self.layer_labels[r.id]] = r
-                self.logo_label_to_ref = {}
-                # with 退出：Session 只关闭自己打开的 doc（即上面的模板文档）
+            self._task_worker.run_load(cfg)
         except Exception as e:
-            messagebox.showerror("PSD 错误", f"无法解析 PSD（请确认 Photoshop 已安装并可启动）：\n{e}")
-            return
+            self._log_gui(f"启动加载任务失败：{e}")
+            self._set_state(AppState.IDLE)
 
-        # ---- Logo 勾选与映射（Stage 3 数据流）----
-        # 概念分离：
-        #   勾选 = selected Logo refs（可含组，仅 GUI selection）
-        #   展开 = resolve_effective_logo_layers(selected) -> 叶子候选
-        #   映射 = store_logo_map（叶子 LayerRef）+ brand_logo_refs（叶子 LayerRef）
-        # 名称启发式只用于「首次自动推荐」；运行时绝不再次 name 猜测。
-        stores = self.excel_stores   # Stage 4：来自 _load_excel_data 的 dataset.stores
+    def _on_load_done(self, result):
+        """Load done (main thread): rebuild GUI from pure data (no COM objects)."""
+        from core.task_events import AppState
+        from core.layer_index import LayerIndex, ref_from_config
+        if not result.ok:
+            messagebox.showerror("加载错误", result.error or "加载失败。")
+            self._set_state(AppState.IDLE)
+            return
+        refs = [ref_from_config(d) for d in result.layer_refs]
+        refs = [r for r in refs if r is not None]
+        index = LayerIndex(refs)
+        self.layer_index = index
+        self._ref_by_id = {r.id: r for r in index.layers}
+        self.layer_labels = index.labels()
+        self.all_psd_layers = [r.name for r in index.layers]
+        self.all_psd_is_group = {r.id: r.is_group for r in index.layers}
+        self.all_psd_parent = {r.id: self._parent_name_of(r) for r in index.layers}
+        self.all_text_layers = [r.display_path for r in index.layers if r.is_text]
+        self.text_label_to_ref = {}
+        for r in index.layers:
+            if r.is_text:
+                self.text_label_to_ref[self.layer_labels[r.id]] = r
+        self.logo_label_to_ref = {}
+        self.excel_stores = result.store_logo_defaults.get("_stores", []) or self.excel_stores
+        opts = ["（不替换）"] + [self.layer_labels[r.id] for r in index.layers if r.is_text]
+        self.tm_name_cb["values"] = opts
+        self.tm_phone_cb["values"] = opts
+        self.tm_role_cb["values"] = opts
+        tdef = result.text_defaults or {}
+        self.tm_name_var.set(self._label_of_text(tdef.get("姓名")) or "（不替换）")
+        self.tm_phone_var.set(self._label_of_text(tdef.get("电话")) or "（不替换）")
+        self.tm_role_var.set(self._label_of_text(tdef.get("销售顾问")) or "（不替换）")
+        self._init_logo_checks(index)
+        self._rebuild_logo_lists()
+        stores = self.excel_stores
+        self._log_gui(f"解析完成：PSD 共 {len(index)} 个图层，Excel 共 {len(stores)} 个门店。")
+        self.logo_info.config(text=f"PSD 图层 {len(index)} 个 ｜ Excel 门店 {len(stores)} 个 ｜ 请在下方勾选 Logo 并完成映射。")
+        self._set_state(AppState.READY)
+
+    def _label_of_text(self, display_path):
+        """find label by display_path for text dropdown auto-suggestion."""
+        if not display_path or self.layer_index is None:
+            return ""
+        for r in self.layer_index.layers:
+            if r.display_path == display_path:
+                return self.layer_labels.get(r.id, r.display_path)
+        return ""
+
+    def _init_logo_checks(self, index):
+        """first-load recommended check + store->logo auto match (equivalent to v1.1.0 _load)."""
+        from core.logo_mapping import (
+            recommend_logo_selection, match_store_logo, EXACT, AUTO)
+        stores = self.excel_stores
+
         def is_logo_candidate(ref):
-            # 仅用于首次加载的推荐勾选（不是运行时规则）
             if ref.is_group:
                 return False
             if "logo" in ref.name.lower():
@@ -1144,139 +1331,68 @@ class App:
                 return True
             return ref.name in stores
 
-        # 首次加载推荐勾选（修复 P1-02）：
-        #   recommend_logo_selection = logo heuristic 勾选 ∪ 与任一门店唯一命中叶子
-        #   —— 保证「普通素材 > 康乐电器」这类无 logo 关键字的门店目标叶子进入
-        #      effective，match_store_logo 才能看到它（AUTO 推荐康乐电器）。
-        #   注意：只在「无保存配置」时推荐；有保存的 logo_selection 一律以保存值为准。
         saved_items_raw = self.cfg.get("logo_selection")
         if saved_items_raw is None:
             saved_items_raw = self.cfg.get("logo_layers", [])
-        has_saved_selection = bool(saved_items_raw)
-
-        # 恢复上次保存的勾选状态（优先新字段 logo_selection，兼容旧 logo_layers）
-        saved_items = saved_items_raw
-        saved_names = {x for x in saved_items if isinstance(x, str)}
-        saved_logo_ids = {ref_from_config(x).id for x in saved_items
-                          if ref_from_config(x) is not None and ref_from_config(x).id}
-
-        def inherited_checked(ref):
-            if ref.id in saved_logo_ids or ref.name in saved_names:
-                return True
-            parent = self._parent_name_of(ref)
-            seen = set()
-            while parent:
-                if parent in saved_names or parent in saved_logo_ids:
-                    return True
-                if parent in seen:
-                    break
-                seen.add(parent)
-                parent = self._parent_name_of_str(parent)
-            return False
-
-        self.logo_checks = {}
-        # 首次推荐（无保存配置时）：recommend_logo_selection（含门店匹配目标）
-        recommend = []
-        if not has_saved_selection:
-            recommend = recommend_logo_selection(
-                self.layer_index.layers, stores, is_logo_heuristic=is_logo_candidate)
-        for ref in self.layer_index.layers:
-            label = self.layer_labels[ref.id]
-            if has_saved_selection:
-                checked = inherited_checked(ref)
+        has_saved = bool(saved_items_raw)
+        saved_logo_ids = set()
+        saved_names = set()
+        for x in saved_items_raw or []:
+            if isinstance(x, str):
+                saved_names.add(x)
             else:
-                checked = ref.id in {r.id for r in recommend} or inherited_checked(ref)
+                rf = ref_from_config(x)
+                if rf is not None and rf.id:
+                    saved_logo_ids.add(rf.id)
+        recommend = []
+        if not has_saved:
+            recommend = recommend_logo_selection(
+                index.layers, stores, is_logo_heuristic=is_logo_candidate)
+        self.logo_checks = {}
+        for ref in index.layers:
+            label = self.layer_labels[ref.id]
+            checked = (ref.id in saved_logo_ids or ref.name in saved_names
+                       or (not has_saved and ref.id in {r.id for r in recommend}))
             self.logo_checks[label] = tk.BooleanVar(value=checked)
-
-        # 自动匹配 门店->Logo：候选 = 当前勾选展开后的全部叶子（含组展开）。
-        # 不再用 is_logo_candidate 预过滤（修复「康乐 -> 康乐电器」P0）：
-        #   先展开 effective leaves，再 match_store_logo 评分；
-        #   AMBIGUOUS / NO_MATCH -> 保持（无），绝不自动选第一个。
-        prev_map = self.cfg.get("store_logo_map", {})
         self.map_combos = {}
-        selected_refs = self._selected_logo_refs()
-        effective_leaves = resolve_effective_logo_layers(self.layer_index, selected_refs)
+        selected = self._selected_logo_refs()
+        eff = resolve_effective_logo_layers(index, selected)
+        prev_map = self.cfg.get("store_logo_map", {})
         for s in stores:
             default_label = "（无）"
             if s in prev_map:
-                prev = prev_map[s]
-                prev_ref = ref_from_config(prev)
-                # 旧配置 name 唯一命中 -> 用；否则视为未配置
-                if prev_ref is not None:
-                    if prev_ref.id and prev_ref.id in self._ref_by_id:
-                        default_label = self.layer_labels[prev_ref.id]
-                    else:
-                        m = self.layer_index.find_matching(prev_ref.name)
-                        if len(m) == 1:
-                            default_label = self.layer_labels[m[0].id]
-                        elif len(m) > 1:
-                            default_label = "（无）"   # ambiguous：不自动选
+                prev = ref_from_config(prev_map[s])
+                if prev is not None and prev.id and prev.id in self._ref_by_id:
+                    default_label = self.layer_labels[prev.id]
             else:
-                # 首次自动推荐：只用当前 effective 叶子候选（不预过滤 name 含 logo）
-                mr = match_store_logo(s, effective_leaves)
+                mr = match_store_logo(s, eff)
                 if mr.status in (EXACT, AUTO) and mr.best is not None:
                     default_label = self.layer_labels[mr.best.id]
-                else:
-                    default_label = "（无）"   # AMBIGUOUS / NO_MATCH：不自动选
             self.map_combos[s] = tk.StringVar(value=default_label)
+        self._init_brand_checks(index, eff)
 
-        # 文字图层映射：Stage 2 候选显示 display_path（同名肉眼可区分）；
-        # 自动匹配：名称（忽略空格）全局唯一才自动选，歧义保持「不替换」
-        opts = ["（不替换）"] + [self.layer_labels[r.id] for r in self.layer_index.layers if r.is_text]
-        self.tm_name_cb["values"] = opts
-        self.tm_phone_cb["values"] = opts
-        self.tm_role_cb["values"] = opts
-        prev_tm = self.cfg.get("text_map", {})
-
-        def auto_text(field):
-            t = field.replace(" ", "")
-            # 先用上次的显式配置（LayerRef dict 或旧 name）
-            if prev_tm.get(field):
-                prev = prev_tm[field]
-                prev_ref = ref_from_config(prev)
-                if prev_ref is not None:
-                    if prev_ref.id and prev_ref.id in self._ref_by_id:
-                        return self.layer_labels[prev_ref.id]
-                    m = self.layer_index.find_matching(prev_ref.name)
-                    if len(m) == 1:
-                        return self.layer_labels[m[0].id]
-                    return "（不替换）"   # ambiguous / missing
-            # 再按名称（去空格）自动匹配：仅当全局唯一
-            m = self.layer_index.find_matching(field)
-            if len(m) == 1:
-                return self.layer_labels[m[0].id]
-            return "（不替换）"
-
-        self.tm_name_var.set(auto_text("姓名"))
-        self.tm_phone_var.set(auto_text("电话"))
-        self.tm_role_var.set(auto_text("销售顾问"))
-
-        # ---- 品牌 Logo 初始勾选（Stage 3 补充）----
-        # 优先级：
-        #   1) 保存配置 brand_logo_layers（重启恢复，人工指定为准）；
-        #   2) 否则 suggest_brand_logos 建议（仅默认建议，非唯一入口）。
-        # 运行时只读保存后的 brand_logo_refs，此处只是预填 GUI 勾选。
+    def _init_brand_checks(self, index, eff):
+        """brand logo initial checks (suggest_brand_logos or saved config)."""
+        from core.logo_mapping import suggest_brand_logos
         saved_brand = self.cfg.get("brand_logo_layers")
         self.brand_checks = {}
         if saved_brand:
-            saved_brand_ids = set()
+            saved_ids = set()
             for v in saved_brand:
-                ref = ref_from_config(v)
-                if ref is not None and ref.id and ref.id in self._ref_by_id:
-                    saved_brand_ids.add(ref.id)
+                rf = ref_from_config(v)
+                if rf is not None and rf.id and rf.id in self._ref_by_id:
+                    saved_ids.add(rf.id)
             for label in self._effective_logo_layers():
                 ref = self._label_to_ref(label)
-                checked = ref is not None and ref.id in saved_brand_ids
-                self.brand_checks[label] = tk.BooleanVar(value=checked)
+                self.brand_checks[label] = tk.BooleanVar(
+                    value=ref is not None and ref.id in saved_ids)
         else:
-            # 首次：suggest_brand_logos 建议（name 含 logo 且未映射）仅默认勾选
-            # 构造 store -> ref（当前下拉已选值，可能为「（无）」）
             store_map_now = {}
             for s, var in self.map_combos.items():
                 v = var.get()
                 store_map_now[s] = self._label_to_ref(v) if v != "（无）" else None
             try:
-                suggest = suggest_brand_logos(effective_leaves, store_map_now)
+                suggest = suggest_brand_logos(eff, store_map_now)
             except Exception:
                 suggest = []
             suggest_ids = {r.id for r in suggest}
@@ -1284,10 +1400,6 @@ class App:
                 ref = self._label_to_ref(label)
                 self.brand_checks[label] = tk.BooleanVar(
                     value=ref is not None and ref.id in suggest_ids)
-
-        self._rebuild_logo_lists()
-        self._log_gui(f"解析完成：PSD 共 {len(self.layer_index)} 个图层，Excel 共 {len(stores)} 个门店。")
-        self.logo_info.config(text=f"PSD 图层 {len(self.layer_index)} 个 ｜ Excel 门店 {len(stores)} 个 ｜ 请在下方勾选 Logo 并完成映射。")
 
     def _parent_name_of(self, ref):
         """返回 LayerRef 的父组名（display_path 倒数第二段）。"""
@@ -1547,9 +1659,12 @@ class App:
         return list(self.all_psd_layers)
 
     def _start(self):
-        if self.running:
+        """Stage 6: Batch into worker (single-worker constraint)."""
+        from core.task_events import AppState
+        if self._state in (AppState.RUNNING, AppState.STOPPING, AppState.LOADING,
+                           AppState.PREVIEWING):
+            messagebox.showwarning("提示", "已有任务正在运行，请稍候。")
             return
-        # Stage 4 补充（BLOCKED B/C）：开始前自动重解析，保证 Dataset 与当前列配置一致
         if not self._ensure_dataset_fresh(trigger="开始"):
             return
         cfg = self._collect_cfg()
@@ -1562,7 +1677,6 @@ class App:
         if not cfg["out_dir"]:
             messagebox.showerror("错误", "请先选择输出目录。")
             return
-        # Stage 4.5：Preflight —— 分组功能已启用但分组列无效时，阻止开始
         if cfg.get("group_output_enabled"):
             try:
                 assert_group_column_valid(
@@ -1571,30 +1685,29 @@ class App:
             except OutputPathError as e:
                 messagebox.showerror("分组配置错误", str(e))
                 return
-
-        self.running = True
-        self.stop_flag.clear()
-        self.btn_run.config(state="disabled")
-        self.btn_stop.config(state="normal")
-        self.btn_preview.config(state="disabled")
+        if self._task_worker.worker_alive:
+            messagebox.showwarning("提示", "已有任务正在运行，请稍候。")
+            return
         self.progress["value"] = 0
-        self._log_gui("开始批量生成...")
-
-        self.worker = threading.Thread(target=self._worker_run, args=(cfg,), daemon=True)
-        self.worker.start()
+        self.progress_label.config(text="0 / 0")
+        self._set_state(AppState.RUNNING)
+        try:
+            self._task_worker.run_batch(cfg)
+        except Exception as e:
+            self._log_gui(f"启动批量任务失败：{e}")
+            self._set_state(AppState.READY)
 
     def _worker_run(self, cfg):
-        def prog(done, total):
-            self.root.after(0, lambda: self._update_progress(done, total))
-        def log(msg):
-            self.root.after(0, lambda: self._log_gui(msg))
-        run_batch(cfg, prog, log, self.stop_flag)
-        self.root.after(0, self._on_finish)
+        """v1.1.0 兼容保留（不再使用）：worker 化后由 TaskWorker._do_batch 替代。"""
+        raise RuntimeError("_worker_run 已由 TaskWorker 替代（Stage 6）")
 
     def _preview(self):
-        if self.running:
+        """Stage 6: Preview into worker (entire Photoshop lifecycle in worker)."""
+        from core.task_events import AppState
+        if self._state in (AppState.RUNNING, AppState.STOPPING, AppState.LOADING,
+                           AppState.PREVIEWING):
+            messagebox.showwarning("提示", "已有任务正在运行，请稍候。")
             return
-        # Stage 4 补充（BLOCKED B/C）：预览前自动重解析，保证 Dataset 与当前列配置一致
         if not self._ensure_dataset_fresh(trigger="预览"):
             return
         cfg = self._collect_cfg()
@@ -1605,107 +1718,76 @@ class App:
         if not cfg["out_dir"]:
             messagebox.showerror("错误", "请先选择输出目录（预览将生成在 输出目录/_preview 下，不污染正式输出）。")
             return
-        # Stage 4.5：Preview 隔离 —— base = out_dir/_preview（与 Batch 同一 resolver，仅 base 不同）
-        preview_base = os.path.join(cfg["out_dir"], "_preview")
-        os.makedirs(preview_base, exist_ok=True)
-        self._log_gui("生成预览（第1行数据）...")
-        # 预览只做第一行（Stage 4：统一入口 load_excel_dataset，用 valid_rows[0]）
-        try:
-            ds = load_excel_dataset(
-                cfg["xlsx_path"],
-                has_header=cfg.get("has_header", True),
-                col_store=cfg["col_store"],
-                col_name=cfg["col_name"],
-                col_phone=cfg["col_phone"],
-                col_role=cfg["col_role"] if cfg.get("col_role", -1) >= 0 else None,
-            )
-            if not ds.valid_rows:
-                self._log_gui("Excel 中没有可生成的有效数据。")
+        if cfg.get("group_output_enabled"):
+            try:
+                assert_group_column_valid(
+                    self.excel_dataset.max_columns if self.excel_dataset is not None else 0,
+                    True, cfg.get("group_output_column"))
+            except OutputPathError as e:
+                messagebox.showerror("分组配置错误", str(e))
                 return
-            r = ds.valid_rows[0]
-            # Stage 4.5：Preflight —— 分组功能已启用但分组列无效时，阻止 Preview
-            group_enabled = bool(cfg.get("group_output_enabled"))
-            group_column = cfg.get("group_output_column")
-            if group_enabled:
-                try:
-                    assert_group_column_valid(ds.max_columns, True, group_column)
-                except OutputPathError as e:
-                    messagebox.showerror("分组配置错误", str(e))
-                    return
-                # 用整批数据建 map：Preview 目录与 Batch 完全一致（碰撞后缀相同）
-                folder_map = build_group_folder_map(ds.valid_rows, group_column)
-            else:
-                folder_map = None
-
-            with PhotoshopSession() as ps:
-                doc0 = ps.open_document(cfg["psd_path"])
-                time.sleep(0.6)
-
-                # Stage 2：运行时 LayerIndex
-                index = collect_layer_index(doc0)
-
-                # Stage 3：Logo 运行时数据（与 Batch 同一构造/校验）
-                logo_map = _build_logo_mapping(cfg, index)
-                logo_err = _validate_runtime_logo(logo_map, index, self._log_gui)
-                if logo_err:
-                    raise LogoVisibilityError(logo_err)
-
-                # ---- Stage 5：Preview 只调 render_one(preview=True) ----
-                # 只负责 ensure fresh/取首行/建 folder map/打开文件/按 RowResult 显示错误。
-                # 不再自行 Duplicate / 替换文字 / Logo / SaveAs / Close。
-                res = render_one(
-                    ps_session=ps,
-                    template_doc=doc0,
-                    row=r,
-                    config={
-                        "fmt": cfg.get("fmt", FMT_PNG),
-                        "also_png": bool(cfg.get("also_png")),
-                        "text_map": cfg.get("text_map", {}),
-                        "group_output_enabled": group_enabled,
-                        "group_output_column": group_column,
-                    },
-                    layer_index=index,
-                    logo_mapping=logo_map,
-                    output_context={
-                        "base_dir": preview_base,
-                        "folder_map": folder_map,
-                    },
-                    index=1,
-                    preview=True,
-                    com_dispatch=win32com.client.Dispatch,
-                    log=self._log_gui,
-                )
-                if res.failed:
-                    for e in res.errors:
-                        self._log_gui(f"预览失败：{e}")
-                    return
-                if not res.output_paths:
-                    self._log_gui("预览失败：未生成任何输出文件。")
-                    return
-                p = res.output_paths[0]
-                self._log_gui(f"预览已生成：{p}")
-                try:
-                    os.startfile(p)
-                except Exception:
-                    pass
+        if self._task_worker.worker_alive:
+            messagebox.showwarning("提示", "已有任务正在运行，请稍候。")
+            return
+        self._set_state(AppState.PREVIEWING)
+        try:
+            self._task_worker.run_preview(cfg)
         except Exception as e:
-            self._log_gui(f"预览失败：{e}")
+            self._log_gui(f"启动预览任务失败：{e}")
+            self._set_state(AppState.READY)
+
+    def _on_preview_done(self, result):
+        """Preview done (main thread): os.startfile 是用户可见动作，由 main thread 执行。"""
+        from core.task_events import AppState
+        if result.ok and result.preview_path:
+            self._log_gui(f"预览已生成：{result.preview_path}")
+            try:
+                os.startfile(result.preview_path)
+            except Exception:
+                pass
+        else:
+            for e in (result.errors or []):
+                self._log_gui(f"预览失败：{e}")
+            if result.error and not result.errors:
+                self._log_gui(f"预览失败：{result.error}")
+        # worker 已退出；PREVIEWING -> READY
+        self._set_state(AppState.READY)
+
+    def _on_batch_done(self, summary):
+        """Batch done (main thread): 显示汇总（Summary 来自结构化 BATCH_DONE payload）。"""
+        from core.task_events import AppState
+        s = summary or {}
+        self._log_gui(
+            f"批量完成：成功 {s.get('success', 0)}，失败 {s.get('failed', 0)}，"
+            f"跳过 {s.get('skipped', 0)}，耗时 {s.get('duration_seconds', 0):.1f}s"
+            + ("（已停止）" if s.get("cancelled") else ""))
+        # 若仍有失败，列出明细
+        for r in s.get("rows", []):
+            if r.get("status") == "FAILED" and r.get("errors"):
+                self._log_gui(f"  [失败 行{r.get('excel_row')}] {'；'.join(r['errors'])}")
+        # Batch 单行失败 ≠ GUI ERROR：回 READY（Stage 6 #24）
+        self._set_state(AppState.READY)
 
     def _stop(self):
-        if self.running:
-            self.stop_flag.set()
-            self._log_gui("正在停止...")
+        """协作式取消：RUNNING -> STOPPING，set cancel_event（不杀线程/Photoshop）。"""
+        from core.task_events import AppState
+        if self._state == AppState.RUNNING:
+            self._set_state(AppState.STOPPING)
+            self._task_worker.request_stop()
+            self._log_gui("正在停止，将在当前 Photoshop 操作完成后结束...")
 
     def _on_finish(self):
-        self.running = False
-        self.btn_run.config(state="normal")
-        self.btn_stop.config(state="disabled")
-        self.btn_preview.config(state="normal")
+        """v1.1.0 兼容保留（不再使用）。"""
+        pass
 
-    def _update_progress(self, done, total):
+    def _update_progress(self, done, total, phase=""):
         if total > 0:
             self.progress["value"] = int(done / total * 100)
-        self.progress_label.config(text=f"{done} / {total}")
+        txt = f"{done} / {total}"
+        if phase:
+            txt += f"（{phase}）"
+        self.progress_label.config(text=txt)
+
 
     def _log_gui(self, msg):
         self.log.config(state="normal")
@@ -1782,12 +1864,20 @@ def main():
         root.tk.call("encoding", "system", "utf-8")
     except Exception:
         pass
-    App(root)
+    app = App(root)
 
     def _on_exit():
-        # Stage 1：不再依赖模块级 _PS_LAUNCHED_BY_US 做全局 Quit 判断。
-        # Session 的 ownership 只属于各自实例；窗口退出时不做任何跨 Session 的
-        # Photoshop Quit / 关闭用户文档动作（避免误伤用户正在使用的 Photoshop）。
+        # Stage 6：安全关闭 —— worker 运行时先协作取消，等 worker 自然退出再 destroy。
+        # 绝不 kill thread / kill Photoshop；也不在 worker 存活时直接 destroy。
+        if app._task_worker.worker_alive:
+            app._pending_close = True
+            app._task_worker.request_close()   # closing flag + cancel_event
+            from core.task_events import AppState
+            if app._state == AppState.RUNNING:
+                app._set_state(AppState.STOPPING)
+            app._log_gui("正在停止并退出（等待当前 Photoshop 操作完成）...")
+            # 轮询仍在运行；worker 退出后 _maybe_destroy 会 destroy root
+            return
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_exit)
