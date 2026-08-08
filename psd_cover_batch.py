@@ -32,6 +32,9 @@ import pythoncom
 import pywintypes
 import openpyxl
 
+# Stage 0：引入 core 纯函数（行为等价），供测试复用
+from core import util as core_util
+
 # ============================================================
 # PSD 图层名映射（按你的模板修改这里）
 # 变更图层名后，用 --inspect 确认即可。
@@ -85,7 +88,8 @@ def set_text(registry, layer_name, text):
 
 
 def sanitize(name):
-    return "".join(c for c in name if c not in '/\\:*?"<>|').strip()
+    """清洗为 Windows 可用文件名片段（由 core.util 提供统一实现）。"""
+    return core_util.sanitize_filename(name)
 
 
 def inspect(psd_path, xlsx_path):
@@ -128,9 +132,6 @@ def inspect(psd_path, xlsx_path):
         for r in list(wb.active.iter_rows(values_only=True))[1:]:
             if r and r[STORE_COL] is not None:
                 stores.add(str(r[STORE_COL]).strip())
-    def fuzzy(a, b):
-        a, b = a.strip(), b.strip()
-        return bool(a) and bool(b) and (a in b or b in a)
     brand_logos = [l.Name for l in doc.Layers
                    if "logo" in l.Name.lower()
                    and l.Name.strip() not in stores
@@ -141,7 +142,7 @@ def inspect(psd_path, xlsx_path):
         if "__group__:" + l.Name in registry or l.Name in brand_set:
             continue
         for s in stores:
-            if fuzzy(l.Name, s):
+            if core_util.fuzzy_contains(l.Name, s):
                 store_map.setdefault(s, []).append(l.Name)
                 break
     print("\n匹配到的门店 Logo 图层（与 Excel 门店名「模糊包含」匹配）:")
@@ -189,10 +190,6 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
 
     # 门店 Logo：与 Excel 门店名「模糊包含」匹配（互含即可，不要求完全一致）。
     # 例如 Excel 的「康乐」可匹配 PSD 的「康乐电器」，「九兴」可匹配「九兴电器」。
-    def fuzzy(a, b):
-        a, b = a.strip(), b.strip()
-        return bool(a) and bool(b) and (a in b or b in a)
-
     store_map = {}      # Excel 门店名 -> 匹配到的 PSD 图层名列表
     store_logos = []    # 去重后的所有门店 Logo 图层名
     for l in doc.Layers:
@@ -201,7 +198,7 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
         if l.Name in brand_set:
             continue
         for s in stores:
-            if fuzzy(l.Name, s):
+            if core_util.fuzzy_contains(l.Name, s):
                 store_map.setdefault(s, []).append(l.Name)
                 if l.Name not in store_logos:
                     store_logos.append(l.Name)

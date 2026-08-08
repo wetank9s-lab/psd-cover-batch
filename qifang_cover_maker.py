@@ -23,6 +23,9 @@ import win32com.client
 import pythoncom
 import openpyxl
 
+# Stage 0：引入 core 纯函数（不依赖 COM / Tk），保持行为一致，供测试与复用
+from core import util as core_util
+
 # ---------------- Photoshop 资源管理 ----------------
 # 关键问题：Photoshop 一旦被 COM 拉起，若不及时退出会一直驻留内存（数百 MB~数 GB）
 # 并占用暂存盘（scratch）。因此记录是否「由本程序拉起」，用完即关闭所有文档并退出 PS，
@@ -249,6 +252,11 @@ def brand_logos_for(logo_layers, store_logo_map):
     return [ln for ln in logo_layers if "logo" in ln.lower() and ln not in mapped_vals]
 
 
+def _fuzzy_contains(a, b):
+    """门店名/图层名互含匹配（归一化后互相包含）。由 core.util.fuzzy_contains 提供。"""
+    return core_util.fuzzy_contains(a, b)
+
+
 def _enable_parents(container):
     """启用 container 及其所有祖先组（直到文档层）。"""
     p = container
@@ -389,8 +397,8 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
                 else:
                     set_layer_visible_by_name(d, ln, visible=(ln == mapped))
 
-            safe_store = store.replace("/", "_").replace("\\", "_")
-            safe_name = name.replace("/", "_").replace("\\", "_")
+            safe_store = core_util.sanitize_filename(store)
+            safe_name = core_util.sanitize_filename(name)
             base = f"{idx:03d}_{safe_store}_{safe_name}"
             if fmt == FMT_PSD:
                 p = os.path.join(out_dir, base + ".psd")

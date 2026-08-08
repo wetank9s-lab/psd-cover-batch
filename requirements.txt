@@ -1,2 +1,5 @@
 pywin32>=300
 openpyxl>=3.0
+
+# 开发 / 测试依赖
+pytest>=7.0
