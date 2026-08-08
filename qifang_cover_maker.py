@@ -769,8 +769,9 @@ class App:
         ttk.Checkbutton(row, text="☑ 按 Excel 列创建输出子文件夹",
                         variable=self.group_output_var).grid(row=4, column=1, sticky="w", pady=3)
         ttk.Label(row, text="分组字段:").grid(row=4, column=2, sticky="e", pady=3)
-        self.group_col_var = tk.StringVar(value=cols[0] if cols else "A")
-        self.group_col_cb = ttk.Combobox(row, textvariable=self.group_col_var, values=cols,
+        # 默认列值：下方 cols（A..Z）才定义，这里用字面量 "A"（加载后按实际列刷新）
+        self.group_col_var = tk.StringVar(value="A")
+        self.group_col_cb = ttk.Combobox(row, textvariable=self.group_col_var, values=["A"],
                                          width=14, state="readonly")
         self.group_col_cb.grid(row=4, column=3, sticky="w", padx=4)
 
