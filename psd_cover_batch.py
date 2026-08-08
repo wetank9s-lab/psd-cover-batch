@@ -35,6 +35,10 @@ import openpyxl
 from core import util as core_util
 # Stage 1：Photoshop 安全资源管理（Session 只关自己 open/duplicate 的文档）
 from core.photoshop import PhotoshopSession, com_retry
+# Stage 2：唯一 LayerRef（index_path 精确定位，取消「图层名 = 图层 ID」）
+from core.layer_index import (
+    collect_layer_index, resolve_layer, ref_from_config, LayerRef,
+)
 
 # ============================================================
 # PSD 图层名映射（按你的模板修改这里）
@@ -59,7 +63,11 @@ def com_call(func, *a, retries=15, **k):
 
 
 def collect_layers(layers, registry, depth=0, parent=""):
-    """递归收集所有图层 name -> 对象，并记录是否为组。"""
+    """递归收集所有图层 name -> 对象，并记录是否为组。
+
+    Stage 2 起：仅用于 inspect() 的组判断与展示；
+    不再承担 text / logo 的 identity（run() 改走 LayerIndex + LayerRef）。
+    """
     for layer in layers:
         registry[layer.Name] = layer
         try:
@@ -71,6 +79,10 @@ def collect_layers(layers, registry, depth=0, parent=""):
 
 
 def set_text(registry, layer_name, text):
+    """（兼容 wrapper，旧 name-only 路径）按 name 设置文字。
+
+    Stage 2 起 run() 不再调用；保留仅作向后兼容 / 未被删除前的最小驻留。
+    """
     if layer_name in registry:
         try:
             registry[layer_name].TextItem.Contents = text
@@ -80,6 +92,28 @@ def set_text(registry, layer_name, text):
             return False
     print(f"  [警告] 未找到文字层 {layer_name!r}，已跳过")
     return False
+
+
+def _resolve_text_ref(index, name):
+    """把旧 name 配置解析为 LayerRef（Stage 2 精确定位）。
+
+    返回 (status, ref | None)：status 见 core.layer_index（VALID/MIGRATED/AMBIGUOUS/MISSING）。
+    """
+    from core.layer_index import rebind_layer_reference
+    return rebind_layer_reference(index, name)
+
+
+def set_text_ref(index, doc, ref, text, label=""):
+    """按 LayerRef 精确定位并写文字（替代按 name 的 set_text）。"""
+    if ref is None:
+        return False
+    try:
+        layer = resolve_layer(doc, ref)
+        layer.TextItem.Contents = text
+        return True
+    except Exception as e:
+        print(f"  [警告] 设置文字层 {label or ref.display_path!r} 失败: {e}")
+        return False
 
 
 def sanitize(name):
@@ -156,8 +190,8 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
             doc = ps.open_document(psd_path)
             ps.app.ActiveDocument = doc
 
-            registry = {}
-            collect_layers(doc.Layers, registry)
+            # Stage 2：用 LayerIndex 建立唯一图层身份（不再用 name 当 ID）
+            index = collect_layer_index(doc)
 
             wb = openpyxl.load_workbook(xlsx_path, data_only=True)
             rows = list(wb.active.iter_rows(values_only=True))
@@ -165,35 +199,51 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
             stores = set(str(r[STORE_COL]).strip() for r in data if r and r[STORE_COL])
             # 品牌 Logo：名字含 "logo"（且不正好等于门店名）的图层 —— 每张封面都显示，
             # 例如「七方logo」「七方logo 拷贝」。可用 --brand-logo 显式指定覆盖自动识别。
-            auto_brand = [l.Name for l in doc.Layers
-                          if "logo" in l.Name.lower()
-                          and l.Name.strip() not in stores
-                          and "__group__:" + l.Name not in registry]
+            auto_brand = [r for r in index.layers
+                          if "logo" in r.name.lower()
+                          and r.name.strip() not in stores
+                          and not r.is_group]
             if brand_logos:
-                brand_logos = [nm for nm in brand_logos if nm in registry and "__group__:" + nm not in registry]
+                brand_logos = [r for r in index.layers
+                               if r.name in brand_logos and not r.is_group]
             else:
                 brand_logos = auto_brand
-            brand_set = set(brand_logos)
+            brand_ids = {r.id for r in brand_logos}
 
             # 门店 Logo：与 Excel 门店名「模糊包含」匹配（互含即可，不要求完全一致）。
             # 例如 Excel 的「康乐」可匹配 PSD 的「康乐电器」，「九兴」可匹配「九兴电器」。
-            store_map = {}      # Excel 门店名 -> 匹配到的 PSD 图层名列表
-            store_logos = []    # 去重后的所有门店 Logo 图层名
-            for l in doc.Layers:
-                if "__group__:" + l.Name in registry:
+            # 用 LayerRef 保存：每个门店 -> 匹配到的 PSD 图层 ref 列表
+            store_map = {}      # Excel 门店名 -> 匹配到的 LayerRef 列表
+            store_logos = []    # 去重后的所有门店 Logo LayerRef
+            seen_logo_ids = set()
+            for r in index.layers:
+                if r.is_group:
                     continue
-                if l.Name in brand_set:
+                if r.id in brand_ids:
                     continue
                 for s in stores:
-                    if core_util.fuzzy_contains(l.Name, s):
-                        store_map.setdefault(s, []).append(l.Name)
-                        if l.Name not in store_logos:
-                            store_logos.append(l.Name)
+                    if core_util.fuzzy_contains(r.name, s):
+                        store_map.setdefault(s, []).append(r)
+                        if r.id not in seen_logo_ids:
+                            seen_logo_ids.add(r.id)
+                            store_logos.append(r)
                         break
-            print(f"检测到门店 Logo 图层 {len(store_logos)} 个: {store_logos}")
+            print(f"检测到门店 Logo 图层 {len(store_logos)} 个: "
+                  f"{[r.display_path for r in store_logos]}")
             for s in sorted(store_map):
-                print(f"    门店 {s!r:12s} -> {store_map[s]}")
-            print(f"品牌 Logo 图层（始终显示）{len(brand_logos)} 个: {brand_logos}")
+                print(f"    门店 {s!r:12s} -> {[r.display_path for r in store_map[s]]}")
+            print(f"品牌 Logo 图层（始终显示）{len(brand_logos)} 个: "
+                  f"{[r.display_path for r in brand_logos]}")
+
+            # 文字层：Stage 2 按 LayerRef 精确定位（旧 name 常量 -> rebind 到唯一 ref；
+            # 若同名歧义则回退 name 并在运行时按「精确 index_path」处理）
+            text_refs = {}
+            for key, legacy in (("姓名", NAME_LAYER), ("电话", PHONE_LAYER),
+                                ("销售顾问", TITLE_LAYER)):
+                status, ref = _resolve_text_ref(index, legacy)
+                text_refs[key] = ref
+                if status in ("AMBIGUOUS", "MISSING") or ref is None:
+                    print(f"  [警告] 文字层 {legacy!r} 无法唯一解析（{status}），该字段将不替换")
 
             todo = [row - 1] if row else list(range(len(data)))
             exported = 0
@@ -214,16 +264,25 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
                 phone = str(phone).strip()
 
                 print(f"\n[{idx + 1}/{len(data)}] 门店={store!r} 姓名={name!r} 电话={phone!r}")
-                set_text(registry, NAME_LAYER, name)
-                set_text(registry, PHONE_LAYER, phone)
-                set_text(registry, TITLE_LAYER, title)
+                set_text_ref(index, doc, text_refs.get("姓名"), name, label=NAME_LAYER)
+                set_text_ref(index, doc, text_refs.get("电话"), phone, label=PHONE_LAYER)
+                set_text_ref(index, doc, text_refs.get("销售顾问"), title, label=TITLE_LAYER)
 
-                target_layers = store_map.get(store, [])
-                for nm in store_logos:
-                    registry[nm].Visible = (nm in target_layers)
-                for nm in brand_logos:
-                    registry[nm].Visible = True
-                shown = target_layers if target_layers else "（无匹配，门店 Logo 全部隐藏）"
+                target_refs = store_map.get(store, [])
+                target_ids = {t.id for t in target_refs}
+                for rr in store_logos:
+                    try:
+                        layer = resolve_layer(doc, rr)
+                        layer.Visible = (rr.id in target_ids)
+                    except Exception as e:
+                        print(f"  [警告] 定位门店 Logo {rr.display_path!r} 失败: {e}")
+                for rr in brand_logos:
+                    try:
+                        layer = resolve_layer(doc, rr)
+                        layer.Visible = True
+                    except Exception as e:
+                        print(f"  [警告] 定位品牌 Logo {rr.display_path!r} 失败: {e}")
+                shown = [t.display_path for t in target_refs] if target_refs else "（无匹配，门店 Logo 全部隐藏）"
                 print(f"  门店 Logo: 显示 {store!r} -> {shown}；品牌 Logo: 全部显示")
 
                 fname = f"{idx + 1:03d}_{sanitize(store)}_{sanitize(name)}.png"

@@ -26,6 +26,12 @@ import openpyxl
 from core import util as core_util
 # Stage 1：Photoshop 安全资源管理（Session 只关自己 open/duplicate 的文档，绝不关用户文档）
 from core.photoshop import PhotoshopSession, PhotoshopSessionError
+# Stage 2：唯一 LayerRef（index_path 精确定位，取消「图层名 = 图层 ID」）
+from core.layer_index import (
+    LayerRef, LayerIndex, collect_layer_index, resolve_layer,
+    rebind_layer_reference, ref_from_config, serialize_ref,
+    VALID, MIGRATED, AMBIGUOUS, MISSING,
+)
 
 # ---------------- Photoshop 资源管理 ----------------
 # Stage 1 起由 core.photoshop.PhotoshopSession 统一管理：
@@ -208,14 +214,40 @@ def set_layer_visible_by_name(doc, target, visible):
     walk(doc)
 
 
+def _ref_key(x):
+    """把配置项（LayerRef dict / 旧 name 字符串 / LayerRef）归一化为唯一 key（id 优先，退化 name）。"""
+    if isinstance(x, LayerRef):
+        return x.id if x.id else x.name
+    r = ref_from_config(x)
+    if r is None:
+        return None
+    return r.id if r.id else r.name
+
+
 def brand_logos_for(logo_layers, store_logo_map):
     """品牌 Logo：名字含 'logo' 且未被用作任何门店 Logo 的图层 —— 每张封面强制显示。
 
     与门店 Logo 区分：门店 Logo 会被映射给某个门店（出现在 store_logo_map 的值里），
     按门店切换显隐；品牌 Logo（如「七方logo」）不属于任何门店，应始终可见。
+
+    Stage 2 语义：门店映射判定用「name 级别」——只要该 name 有任一图层被映射为门店，
+    所有同名图层都视为门店候选（避免同名 Logo 一个被映射、另一个被误判为品牌）。
+    logo_layers / store_logo_map 可能是 LayerRef dict 或旧 name 字符串。
     """
-    mapped_vals = set(v for v in store_logo_map.values() if v)
-    return [ln for ln in logo_layers if "logo" in ln.lower() and ln not in mapped_vals]
+    mapped_names = set()
+    for v in store_logo_map.values():
+        r = ref_from_config(v)
+        if r is not None:
+            mapped_names.add(r.name)
+    out = []
+    for ln in logo_layers:
+        r = ref_from_config(ln)
+        if r is None:
+            continue
+        nm = r.name or ""
+        if nm.lower().find("logo") >= 0 and nm not in mapped_names:
+            out.append(ln)
+    return out
 
 
 def _fuzzy_contains(a, b):
@@ -232,6 +264,87 @@ def _enable_parents(container):
             p = p.Parent
         except Exception:
             break
+
+
+# ----------------------------------------------------------------------------
+# Stage 2：LayerRef 精确操作辅助（替代「按 name 找第一个」的运行时定位）
+# ----------------------------------------------------------------------------
+def _find_indexed_layer(doc, index, ref_or_name):
+    """把配置值（LayerRef dict / 旧 name 字符串 / LayerRef 对象）解析为 COM Layer。
+
+    - 优先按 LayerRef.index_path 精确定位（resolve_layer，绝不 fallback 同名）；
+    - 纯 name（旧配置 / 无 index_path）时走 rebind：唯一 -> 用之；歧义/缺失 -> None；
+    - 返回 (layer, status)；status 用于日志（VALID/MIGRATED/AMBIGUOUS/MISSING/STALE）。
+    """
+    from core.layer_index import resolve_layer
+    if isinstance(ref_or_name, LayerRef):
+        ref = ref_or_name
+    else:
+        ref = ref_from_config(ref_or_name)
+    if ref is None:
+        return None, MISSING
+    if ref.index_path:
+        try:
+            return resolve_layer(doc, ref), VALID
+        except Exception as e:
+            # index_path 失效（结构变化）：尝试按 name rebind，标记 MIGRATED/AMBIGUOUS
+            status, cand = rebind_layer_reference(index, ref.name)
+            if cand is not None:
+                try:
+                    return resolve_layer(doc, cand), MIGRATED
+                except Exception:
+                    return None, status
+            return None, status
+    # 纯 name（旧配置）
+    status, cand = rebind_layer_reference(index, ref.name)
+    if cand is None:
+        return None, status
+    try:
+        return resolve_layer(doc, cand), status
+    except Exception:
+        return None, status
+
+
+def set_text_by_ref(doc, index, ref_or_name, value, log=None, label=""):
+    """按 LayerRef 精确替换文字层（找不到/歧义时记日志并跳过，不抛异常）。"""
+    if not ref_or_name:
+        return False
+    layer, status = _find_indexed_layer(doc, index, ref_or_name)
+    if layer is None:
+        if log:
+            reason = {"AMBIGUOUS": "同名图层多个，无法唯一确定",
+                      "MISSING": "找不到该图层",
+                      "MIGRATED": "已按唯一名称迁移"}.get(status, str(status))
+            log(f"  警告：文字层 {label or ref_or_name} 定位失败（{reason}），已跳过该字段。")
+        return False
+    try:
+        _ = layer.TextItem.Contents
+    except Exception:
+        if log:
+            log(f"  警告：图层 {label or ref_or_name} 不是文字图层，已跳过该字段。")
+        return False
+    return set_text_safe(layer, value)
+
+
+def set_visible_by_ref(doc, index, ref_or_name, visible, log=None, label=""):
+    """按 LayerRef 精确设置图层可见性；可见时启用父组。返回 (ok, status)。"""
+    if ref_or_name is None:
+        return False, MISSING
+    layer, status = _find_indexed_layer(doc, index, ref_or_name)
+    if layer is None:
+        return False, status
+    try:
+        layer.Visible = visible
+        if visible:
+            try:
+                _enable_parents(layer.Parent)
+            except Exception:
+                pass
+        return True, status
+    except Exception as e:
+        if log:
+            log(f"  警告：设置可见性失败：{label or ref_or_name}：{e}")
+        return False, status
 
 
 def set_text_safe(layer, text, retries=6):
@@ -300,15 +413,18 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
             doc0 = ps.open_document(cfg["psd_path"])
             time.sleep(0.6)
 
+            # Stage 2：运行时建立 LayerIndex（对当前打开的模板文档）
+            index = collect_layer_index(doc0)
+
             text_map = cfg.get("text_map", {})
-            name_layer = text_map.get("姓名", "")
-            phone_layer = text_map.get("电话", "")
-            role_layer = text_map.get("销售顾问", "")
+            name_ref = text_map.get("姓名", "")
+            phone_ref = text_map.get("电话", "")
+            role_ref = text_map.get("销售顾问", "")
 
             log_cb(f"模板已加载（{doc0.Width}x{doc0.Height}）。"
-                   f"文字层映射：姓名→{name_layer or '（不替换）'}，"
-                   f"电话→{phone_layer or '（不替换）'}，"
-                   f"销售顾问→{role_layer or '（不替换）'}。")
+                   f"文字层映射：姓名→{name_ref.get('display_path') if isinstance(name_ref, dict) else (name_ref or '（不替换）')}，"
+                   f"电话→{phone_ref.get('display_path') if isinstance(phone_ref, dict) else (phone_ref or '（不替换）')}，"
+                   f"销售顾问→{role_ref.get('display_path') if isinstance(role_ref, dict) else (role_ref or '（不替换）')}。")
 
             out_dir = cfg["out_dir"]
             os.makedirs(out_dir, exist_ok=True)
@@ -343,27 +459,30 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
                     app.ActiveDocument = d
                     time.sleep(0.05)
 
-                    # 姓名（字号样式与 PSD 模板保持一致，长姓名不缩放）
-                    if name_layer:
-                        nl = find_layer(d, name_layer)
-                        if nl is not None:
-                            set_text_safe(nl, name)
+                    # Stage 2：按 LayerRef 精确定位（同 LayerRef 在 duplicate 上重新 resolve，
+                    # 绝不把 template 的 COM layer 拿去操作 duplicate）
+                    if name_ref:
+                        set_text_by_ref(d, index, name_ref, name, log_cb, label="姓名")
                     # 电话
-                    if phone_layer:
-                        safe_replace_text(d, phone_layer, phone_s, log_cb)
+                    if phone_ref:
+                        set_text_by_ref(d, index, phone_ref, phone_s, log_cb, label="电话")
                     # 销售顾问（仅当 Excel 该列有值）
-                    if role_layer and role is not None:
-                        safe_replace_text(d, role_layer, role, log_cb)
+                    if role_ref and role is not None:
+                        set_text_by_ref(d, index, role_ref, role, log_cb, label="销售顾问")
 
                     # Logo 图层切换：只显示本门店对应的 Logo，隐藏其余候选 Logo；
-                    # 品牌 Logo（含 'logo' 且非门店 Logo）每张封面强制显示
+                    # 品牌 Logo（含 'logo' 且非门店 Logo）每张封面强制显示。
+                    # Stage 2：identity 已改为 LayerRef（layer_id），业务规则（品牌/门店）不变。
                     mapped = store_logo_map.get(store, "")
-                    brand = brand_logos_for(logo_layers, store_logo_map)
-                    for ln in logo_layers:
-                        if ln in brand:
-                            set_layer_visible_by_name(d, ln, visible=True)
+                    brand = brand_logos_for(cfg["logo_layers"], cfg["store_logo_map"])
+                    brand_keys = {_ref_key(x) for x in brand}
+                    mapped_key = _ref_key(mapped) if mapped else None
+                    for ln in cfg["logo_layers"]:
+                        if _ref_key(ln) in brand_keys:
+                            set_visible_by_ref(d, index, ln, True, log_cb, label="品牌Logo")
                         else:
-                            set_layer_visible_by_name(d, ln, visible=(ln == mapped))
+                            set_visible_by_ref(d, index, ln, (_ref_key(ln) == mapped_key),
+                                               log_cb, label="门店Logo")
 
                     safe_store = core_util.sanitize_filename(store)
                     safe_name = core_util.sanitize_filename(name)
@@ -422,6 +541,12 @@ class App:
         self.all_psd_is_group = {}
         self.all_psd_parent = {}
         self.all_text_layers = []
+        # Stage 2：LayerRef 状态（唯一图层身份）
+        self.layer_index = None          # 当前 PSD 的 LayerIndex（不丢同名）
+        self._ref_by_id = {}             # layer_id -> LayerRef
+        self.layer_labels = {}           # layer_id -> 展示 label（同名时含 [id=...] 后缀，保证肉眼可区分）
+        self.text_label_to_ref = {}      # label -> LayerRef（文字层）
+        self.logo_label_to_ref = {}      # label -> LayerRef（当前有效 Logo 叶子）
         self.excel_stores = []
         self.excel_headers = []
         self.running = False
@@ -679,66 +804,99 @@ class App:
             with PhotoshopSession() as ps:
                 doc = ps.open_document(psd)
                 time.sleep(0.6)
-                layers = collect_layer_names(doc)  # [(name, is_group, parent_name)]
-                self.all_text_layers = collect_text_layer_names(doc)
+                # Stage 2：建立唯一 LayerIndex（不丢同名图层），替代旧的按 name 去重
+                self.layer_index = collect_layer_index(doc)
+                self._ref_by_id = {r.id: r for r in self.layer_index.layers}
+                self.layer_labels = self.layer_index.labels()   # id -> 唯一 label
+                # 兼容缓存（旧逻辑仍读取；新建逻辑优先用 layer_index）
+                self.all_psd_layers = [r.name for r in self.layer_index.layers]
+                self.all_psd_is_group = {r.id: r.is_group for r in self.layer_index.layers}
+                self.all_psd_parent = {r.id: self._parent_name_of(r) for r in self.layer_index.layers}
+                self.all_text_layers = [r.display_path for r in self.layer_index.layers if r.is_text]
+                # 文字层 label -> LayerRef（同名 display_path 已由 labels 附加 id 后缀）
+                self.text_label_to_ref = {}
+                for r in self.layer_index.layers:
+                    if r.is_text:
+                        self.text_label_to_ref[self.layer_labels[r.id]] = r
+                self.logo_label_to_ref = {}
                 # with 退出：Session 只关闭自己打开的 doc（即上面的模板文档）
-            self.all_psd_layers = [n for n, _, _ in layers]
-            self.all_psd_is_group = {n: g for n, g, _ in layers}
-            self.all_psd_parent = {n: p for n, _, p in layers}
         except Exception as e:
             messagebox.showerror("PSD 错误", f"无法解析 PSD（请确认 Photoshop 已安装并可启动）：\n{e}")
             return
 
         # 默认勾选 Logo 候选：名称含 "logo"，或位于名为 logo 的组内，
         # 或图层名与 Excel 门店名一致（平铺式门店 Logo），且本身不是组
-        def is_logo_candidate(nm):
-            if self.all_psd_is_group.get(nm, False):
+        def is_logo_candidate(ref):
+            if ref.is_group:
                 return False
-            if "logo" in nm.lower():
+            if "logo" in ref.name.lower():
                 return True
-            parent = (self.all_psd_parent.get(nm, "") or "").lower()
+            parent = (self._parent_name_of(ref) or "").lower()
             if "logo" in parent:
                 return True
-            return nm in stores
+            return ref.name in stores
 
         # 恢复上次保存的 Logo 勾选状态（含勾选的组），否则按名称启发式默认
-        saved_logo = set(self.cfg.get("logo_layers", []))
+        # Stage 2：logo_layers 可能是 LayerRef dict 或旧 name 字符串；
+        # dict 不可 hash，不能直接 set()，统一转成 name/id 判断。
+        saved_items = self.cfg.get("logo_layers", [])
+        saved_names = {x for x in saved_items if isinstance(x, str)}
+        saved_logo_ids = {ref_from_config(x).id for x in saved_items
+                          if ref_from_config(x) is not None and ref_from_config(x).id}
+        saved_logo = saved_names
         children_map = self._build_children_map()
 
-        def inherited_checked(nm):
-            if nm in saved_logo:
+        def inherited_checked(ref):
+            if ref.id in saved_logo_ids or ref.name in saved_names:
                 return True
-            parent = self.all_psd_parent.get(nm, "")
+            parent = self._parent_name_of(ref)
             seen = set()
             while parent:
-                if parent in saved_logo:
+                if parent in saved_names or parent in saved_logo_ids:
                     return True
                 if parent in seen:
                     break
                 seen.add(parent)
-                parent = self.all_psd_parent.get(parent, "")
+                parent = self._parent_name_of_str(parent)
             return False
 
         self.logo_checks = {}
-        for nm in self.all_psd_layers:
-            self.logo_checks[nm] = tk.BooleanVar(
-                value=(is_logo_candidate(nm) or inherited_checked(nm)))
+        for ref in self.layer_index.layers:
+            label = self.layer_labels[ref.id]
+            checked = is_logo_candidate(ref) or inherited_checked(ref)
+            self.logo_checks[label] = tk.BooleanVar(value=checked)
 
-        # 自动匹配 门店->Logo（图层名包含门店名则自动选）
+        # 自动匹配 门店->Logo（图层名包含门店名则自动选；Stage 2：同名歧义不自动选第一个）
         prev_map = self.cfg.get("store_logo_map", {})
         self.map_combos = {}
-        logo_candidates = [nm for nm in self.all_psd_layers if is_logo_candidate(nm)]
+        logo_candidate_refs = [r for r in self.layer_index.layers if is_logo_candidate(r)]
         for s in stores:
+            default_label = "（无）"
             if s in prev_map:
-                default = prev_map[s]
+                prev = prev_map[s]
+                prev_ref = ref_from_config(prev)
+                # 旧配置 name 唯一命中 -> 用；否则视为未配置
+                if prev_ref is not None:
+                    if prev_ref.id and prev_ref.id in self._ref_by_id:
+                        default_label = self.layer_labels[prev_ref.id]
+                    else:
+                        m = self.layer_index.find_matching(prev_ref.name)
+                        if len(m) == 1:
+                            default_label = self.layer_labels[m[0].id]
+                        elif len(m) > 1:
+                            default_label = "（无）"   # ambiguous：不自动选
             else:
-                hit = next((ln for ln in logo_candidates
-                            if s.lower() in ln.lower() or ln.lower() in s.lower()), "")
-                default = hit
-            self.map_combos[s] = tk.StringVar(value=default)
+                hits = [r for r in logo_candidate_refs
+                        if core_util.fuzzy_contains(r.name, s)]
+                if len(hits) == 1:
+                    default_label = self.layer_labels[hits[0].id]
+                elif len(hits) > 1:
+                    default_label = "（无）"   # 同名歧义：不自动选
+            self.map_combos[s] = tk.StringVar(value=default_label)
 
-        # 文字图层映射：自动按（忽略空格的）名称匹配；找不到则「不替换」
-        opts = ["（不替换）"] + self.all_text_layers
+        # 文字图层映射：Stage 2 候选显示 display_path（同名肉眼可区分）；
+        # 自动匹配：名称（忽略空格）全局唯一才自动选，歧义保持「不替换」
+        opts = ["（不替换）"] + [self.layer_labels[r.id] for r in self.layer_index.layers if r.is_text]
         self.tm_name_cb["values"] = opts
         self.tm_phone_cb["values"] = opts
         self.tm_role_cb["values"] = opts
@@ -746,13 +904,21 @@ class App:
 
         def auto_text(field):
             t = field.replace(" ", "")
-            # 先用上次的显式配置
+            # 先用上次的显式配置（LayerRef dict 或旧 name）
             if prev_tm.get(field):
-                return prev_tm[field]
-            # 再按名称（去空格）自动匹配
-            for tn in self.all_text_layers:
-                if tn.replace(" ", "") == t:
-                    return tn
+                prev = prev_tm[field]
+                prev_ref = ref_from_config(prev)
+                if prev_ref is not None:
+                    if prev_ref.id and prev_ref.id in self._ref_by_id:
+                        return self.layer_labels[prev_ref.id]
+                    m = self.layer_index.find_matching(prev_ref.name)
+                    if len(m) == 1:
+                        return self.layer_labels[m[0].id]
+                    return "（不替换）"   # ambiguous / missing
+            # 再按名称（去空格）自动匹配：仅当全局唯一
+            m = self.layer_index.find_matching(field)
+            if len(m) == 1:
+                return self.layer_labels[m[0].id]
             return "（不替换）"
 
         self.tm_name_var.set(auto_text("姓名"))
@@ -760,32 +926,71 @@ class App:
         self.tm_role_var.set(auto_text("销售顾问"))
 
         self._rebuild_logo_lists()
-        self._log_gui(f"解析完成：PSD 共 {len(layers)} 个图层，Excel 共 {len(stores)} 个门店。")
-        self.logo_info.config(text=f"PSD 图层 {len(layers)} 个 ｜ Excel 门店 {len(stores)} 个 ｜ 请在下方勾选 Logo 并完成映射。")
+        self._log_gui(f"解析完成：PSD 共 {len(self.layer_index)} 个图层，Excel 共 {len(stores)} 个门店。")
+        self.logo_info.config(text=f"PSD 图层 {len(self.layer_index)} 个 ｜ Excel 门店 {len(stores)} 个 ｜ 请在下方勾选 Logo 并完成映射。")
+
+    def _parent_name_of(self, ref):
+        """返回 LayerRef 的父组名（display_path 倒数第二段）。"""
+        if not ref or not ref.display_path:
+            return ""
+        parts = [p.strip() for p in ref.display_path.split(">")]
+        return parts[-2] if len(parts) >= 2 else ""
+
+    def _parent_name_of_str(self, name):
+        """兼容：按 name 找 ref 再取父名（旧逻辑用）。"""
+        if self.layer_index is None:
+            return ""
+        m = self.layer_index.find_matching(name)
+        if len(m) == 1:
+            return self._parent_name_of(m[0])
+        return ""
+
+    def _label_to_ref(self, label):
+        """把展示 label（display_path 或 display_path [id=...]）解析回 LayerRef。"""
+        if self.layer_index is None:
+            return None
+        if not label:
+            return None
+        # 优先精确 id 后缀
+        for r in self.layer_index.layers:
+            if self.layer_labels.get(r.id) == label:
+                return r
+        # 退化为 display_path 匹配
+        for r in self.layer_index.layers:
+            if r.display_path == label:
+                return r
+        return None
 
     def _build_children_map(self):
-        """根据 all_psd_parent 构建 父名 -> [子名,...] 映射。"""
+        """根据 all_psd_parent 构建 父名 -> [子名,...] 映射（兼容旧逻辑）。"""
         children = {}
-        for nm, parent in self.all_psd_parent.items():
+        for rid, parent in self.all_psd_parent.items():
             if parent:
-                children.setdefault(parent, []).append(nm)
+                children.setdefault(parent, []).append(rid)
         return children
 
     def _effective_logo_layers(self):
-        """返回当前应作为候选 Logo 的『叶子图层』列表（含被勾选组的子图层）。"""
+        """返回当前应作为候选 Logo 的『叶子图层 label 列表』（含被勾选组的子图层）。"""
         children = self._build_children_map()
         result = []
 
-        def collect(nm):
-            if self.all_psd_is_group.get(nm, False):
-                for ch in children.get(nm, []):
+        def collect(rid):
+            ref = self._ref_by_id.get(rid)
+            if ref is None:
+                return
+            if ref.is_group:
+                for ch in children.get(rid, []):
                     collect(ch)
-            elif nm not in result:
-                result.append(nm)
+            else:
+                label = self.layer_labels.get(rid)
+                if label and label not in result:
+                    result.append(label)
 
-        for nm, var in self.logo_checks.items():
+        for label, var in self.logo_checks.items():
             if var.get():
-                collect(nm)
+                ref = self._label_to_ref(label)
+                if ref is not None:
+                    collect(ref.id)
         return result
 
     def _rebuild_logo_lists(self):
@@ -796,14 +1001,14 @@ class App:
             w.destroy()
         self.map_combo_widgets = {}
 
-        ttk.Label(self.logo_inner, text="☑ 图层名称", font=("Microsoft YaHei", 9, "bold")).grid(
+        ttk.Label(self.logo_inner, text="☑ 图层（显示完整路径）", font=("Microsoft YaHei", 9, "bold")).grid(
             row=0, column=0, sticky="w", padx=4, pady=2)
-        for i, nm in enumerate(self.all_psd_layers, start=1):
-            cb = ttk.Checkbutton(self.logo_inner, text=nm, variable=self.logo_checks[nm])
+        for i, label in enumerate(self.logo_checks.keys(), start=1):
+            cb = ttk.Checkbutton(self.logo_inner, text=label, variable=self.logo_checks[label])
             cb.grid(row=i, column=0, sticky="w", padx=4, pady=1)
             # 勾选状态变化时，同步刷新右侧门店→Logo 下拉列表
-            self.logo_checks[nm].trace_add(
-                "write", lambda *a, nm=nm: self._on_logo_checks_changed())
+            self.logo_checks[label].trace_add(
+                "write", lambda *a: self._on_logo_checks_changed())
 
         # 映射表
         ttk.Label(self.map_inner, text="门店", font=("Microsoft YaHei", 9, "bold")).grid(
@@ -814,7 +1019,7 @@ class App:
         for i, s in enumerate(self.excel_stores, start=1):
             ttk.Label(self.map_inner, text=s).grid(row=i, column=0, sticky="w", padx=4, pady=1)
             cb = ttk.Combobox(self.map_inner, textvariable=self.map_combos[s],
-                              values=logo_opts, width=26, state="readonly")
+                              values=logo_opts, width=40, state="readonly")
             cb.grid(row=i, column=1, sticky="w", padx=4, pady=1)
             self.map_combo_widgets[s] = cb
 
@@ -834,16 +1039,29 @@ class App:
     def _collect_cfg(self):
         col_of = lambda v: -1 if v == "（不替换）" else ord(v) - ord("A")
         # 保存用户显式勾选的图层（含组），用于下次加载时恢复
-        logo_layers = [nm for nm in self.all_psd_layers
-                       if self.logo_checks.get(nm, tk.BooleanVar()).get()]
+        # Stage 2：以 LayerRef dict 保存（layer_id/name/display_path），并保留 name 供旧版兼容
+        def ref_to_cfg(label):
+            ref = self._label_to_ref(label)
+            if ref is None:
+                return label   # 旧 name（极端情况）
+            return serialize_ref(ref)
+
+        logo_layers = [ref_to_cfg(label)
+                       for label in self.all_psd_layers_labels()
+                       if self.logo_checks.get(label, tk.BooleanVar()).get()]
         store_logo_map = {}
         for s, var in self.map_combos.items():
             val = var.get()
-            store_logo_map[s] = "" if val == "（无）" else val
+            store_logo_map[s] = "" if val == "（无）" else ref_to_cfg(val)
+        def tm_val(var):
+            v = var.get()
+            if v == "（不替换）":
+                return ""
+            return ref_to_cfg(v)
         text_map = {
-            "姓名": "" if self.tm_name_var.get() == "（不替换）" else self.tm_name_var.get(),
-            "电话": "" if self.tm_phone_var.get() == "（不替换）" else self.tm_phone_var.get(),
-            "销售顾问": "" if self.tm_role_var.get() == "（不替换）" else self.tm_role_var.get(),
+            "姓名": tm_val(self.tm_name_var),
+            "电话": tm_val(self.tm_phone_var),
+            "销售顾问": tm_val(self.tm_role_var),
         }
         return {
             "psd_path": self.psd_var.get().strip(),
@@ -860,6 +1078,12 @@ class App:
             "fmt": self.fmt_var.get(),
             "also_png": self.also_png_var.get(),
         }
+
+    def all_psd_layers_labels(self):
+        """当前 PSD 全部图层的展示 label（与 logo_checks 的 key 一致）。"""
+        if self.layer_index is not None:
+            return [self.layer_labels[r.id] for r in self.layer_index.layers]
+        return list(self.all_psd_layers)
 
     def _start(self):
         if self.running:
@@ -927,10 +1151,13 @@ class App:
                 doc0 = ps.open_document(cfg["psd_path"])
                 time.sleep(0.6)
 
+                # Stage 2：运行时 LayerIndex
+                index = collect_layer_index(doc0)
+
                 text_map = cfg.get("text_map", {})
-                name_layer = text_map.get("姓名", "")
-                phone_layer = text_map.get("电话", "")
-                role_layer = text_map.get("销售顾问", "")
+                name_ref = text_map.get("姓名", "")
+                phone_ref = text_map.get("电话", "")
+                role_ref = text_map.get("销售顾问", "")
 
                 d = None
                 try:
@@ -938,22 +1165,24 @@ class App:
                     app.ActiveDocument = d
                     time.sleep(0.05)
 
-                    if name_layer:
-                        nl = find_layer(d, name_layer)
-                        if nl is not None:
-                            set_text_safe(nl, name)
-                    if phone_layer:
-                        safe_replace_text(d, phone_layer, phone_s, self._log_gui)
-                    if role_layer and role is not None:
-                        safe_replace_text(d, role_layer, role, self._log_gui)
+                    # Stage 2：按 LayerRef 精确 resolve（duplicate 上重新定位）
+                    if name_ref:
+                        set_text_by_ref(d, index, name_ref, name, self._log_gui, label="姓名")
+                    if phone_ref:
+                        set_text_by_ref(d, index, phone_ref, phone_s, self._log_gui, label="电话")
+                    if role_ref and role is not None:
+                        set_text_by_ref(d, index, role_ref, role, self._log_gui, label="销售顾问")
 
                     mapped = cfg["store_logo_map"].get(store, "")
                     brand = brand_logos_for(cfg["logo_layers"], cfg["store_logo_map"])
+                    brand_keys = {_ref_key(x) for x in brand}
+                    mapped_key = _ref_key(mapped) if mapped else None
                     for ln in cfg["logo_layers"]:
-                        if ln in brand:
-                            set_layer_visible_by_name(d, ln, visible=True)
+                        if _ref_key(ln) in brand_keys:
+                            set_visible_by_ref(d, index, ln, True, self._log_gui, label="品牌Logo")
                         else:
-                            set_layer_visible_by_name(d, ln, visible=(ln == mapped))
+                            set_visible_by_ref(d, index, ln, (_ref_key(ln) == mapped_key),
+                                               self._log_gui, label="门店Logo")
                     p = os.path.join(tmp, "preview.png")
                     export_doc(d, p, FMT_PNG)
                     self._log_gui(f"预览已生成：{p}")
@@ -1023,13 +1252,29 @@ class App:
             self.also_png_var.set(c.get("also_png", False))
             # 文字图层映射（加载后会在 _load 中按实际图层校正，这里仅预填）
             tm = c.get("text_map", {})
-            self.tm_name_var.set(tm.get("姓名", "") or "（不替换）")
-            self.tm_phone_var.set(tm.get("电话", "") or "（不替换）")
-            self.tm_role_var.set(tm.get("销售顾问", "") or "（不替换）")
+            self.tm_name_var.set(self._tm_display(tm.get("姓名", "")))
+            self.tm_phone_var.set(self._tm_display(tm.get("电话", "")))
+            self.tm_role_var.set(self._tm_display(tm.get("销售顾问", "")))
             # 保留上次的 logo 勾选与映射，供 _load 默认填充
             self.cfg = c
         except Exception:
             pass
+
+    def _tm_display(self, v):
+        """把配置值（LayerRef dict 或旧 name 字符串）转成 GUI 下拉显示 label（未加载 PSD 时原样返回）。"""
+        if not v:
+            return "（不替换）"
+        if self.layer_index is None:
+            return v
+        ref = ref_from_config(v)
+        if ref is None:
+            return "（不替换）"
+        if ref.id and ref.id in self._ref_by_id:
+            return self.layer_labels[ref.id]
+        m = self.layer_index.find_matching(ref.name)
+        if len(m) == 1:
+            return self.layer_labels[m[0].id]
+        return "（不替换）"   # ambiguous / missing：不自动选
 
 
 def main():
