@@ -43,8 +43,8 @@ TITLE_LAYER = "销售顾问 拷贝"   # 职位 / 头衔文字图层（如「销�
 # Excel 列索引（0 开始）：A=门店, B=姓名, C=职位, D=电话
 STORE_COL, NAME_COL, TITLE_COL, PHONE_COL = 0, 1, 2, 3
 
-# 输出的门店 Logo 图层判定：图层名 == Excel 里的门店名
-# （其它与门店名不匹配的顶层图层不会被隐藏，可放心保留背景 / 品牌 Logo）
+# 输出的门店 Logo 图层判定：图层名与 Excel 门店名「模糊包含」匹配（互含即可，
+# 例如 Excel「康乐」可匹配 PSD「康乐电器」）。品牌 Logo（名字含 logo）始终显示。
 
 
 # ---------- COM 调用重试（解决 Photoshop 「应用程序正忙」）----------
@@ -128,14 +128,28 @@ def inspect(psd_path, xlsx_path):
         for r in list(wb.active.iter_rows(values_only=True))[1:]:
             if r and r[STORE_COL] is not None:
                 stores.add(str(r[STORE_COL]).strip())
-    top_logos = [l.Name for l in doc.Layers
-                 if l.Name.strip() in stores and "__group__:" + l.Name not in registry]
+    def fuzzy(a, b):
+        a, b = a.strip(), b.strip()
+        return bool(a) and bool(b) and (a in b or b in a)
     brand_logos = [l.Name for l in doc.Layers
                    if "logo" in l.Name.lower()
                    and l.Name.strip() not in stores
                    and "__group__:" + l.Name not in registry]
-    print("\n匹配到的门店 Logo 图层（图层名 == Excel 门店名）:")
-    print("  " + (", ".join(top_logos) if top_logos else "(无，请检查门店名是否与图层名一致)"))
+    brand_set = set(brand_logos)
+    store_map = {}
+    for l in doc.Layers:
+        if "__group__:" + l.Name in registry or l.Name in brand_set:
+            continue
+        for s in stores:
+            if fuzzy(l.Name, s):
+                store_map.setdefault(s, []).append(l.Name)
+                break
+    print("\n匹配到的门店 Logo 图层（与 Excel 门店名「模糊包含」匹配）:")
+    if store_map:
+        for s in sorted(store_map):
+            print(f"  {s!r:12s} -> {store_map[s]}")
+    else:
+        print("  (无，请检查门店名是否与图层名存在包含关系)")
     print("\n品牌 Logo 图层（名字含 logo，每张封面都显示）:")
     print("  " + (", ".join(brand_logos) if brand_logos else "(无)"))
 
@@ -161,8 +175,6 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
     rows = list(wb.active.iter_rows(values_only=True))
     header, data = rows[0], rows[1:]
     stores = set(str(r[STORE_COL]).strip() for r in data if r and r[STORE_COL])
-    store_logos = [l.Name for l in doc.Layers
-                   if l.Name.strip() in stores and "__group__:" + l.Name not in registry]
     # 品牌 Logo：名字含 "logo"（且不正好等于门店名）的图层 —— 每张封面都显示，
     # 例如「七方logo」「七方logo 拷贝」。可用 --brand-logo 显式指定覆盖自动识别。
     auto_brand = [l.Name for l in doc.Layers
@@ -173,7 +185,30 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
         brand_logos = [nm for nm in brand_logos if nm in registry and "__group__:" + nm not in registry]
     else:
         brand_logos = auto_brand
+    brand_set = set(brand_logos)
+
+    # 门店 Logo：与 Excel 门店名「模糊包含」匹配（互含即可，不要求完全一致）。
+    # 例如 Excel 的「康乐」可匹配 PSD 的「康乐电器」，「九兴」可匹配「九兴电器」。
+    def fuzzy(a, b):
+        a, b = a.strip(), b.strip()
+        return bool(a) and bool(b) and (a in b or b in a)
+
+    store_map = {}      # Excel 门店名 -> 匹配到的 PSD 图层名列表
+    store_logos = []    # 去重后的所有门店 Logo 图层名
+    for l in doc.Layers:
+        if "__group__:" + l.Name in registry:
+            continue
+        if l.Name in brand_set:
+            continue
+        for s in stores:
+            if fuzzy(l.Name, s):
+                store_map.setdefault(s, []).append(l.Name)
+                if l.Name not in store_logos:
+                    store_logos.append(l.Name)
+                break
     print(f"检测到门店 Logo 图层 {len(store_logos)} 个: {store_logos}")
+    for s in sorted(store_map):
+        print(f"    门店 {s!r:12s} -> {store_map[s]}")
     print(f"品牌 Logo 图层（始终显示）{len(brand_logos)} 个: {brand_logos}")
 
     todo = [row - 1] if row else list(range(len(data)))
@@ -199,11 +234,13 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
         set_text(registry, PHONE_LAYER, phone)
         set_text(registry, TITLE_LAYER, title)
 
+        target_layers = store_map.get(store, [])
         for nm in store_logos:
-            registry[nm].Visible = (nm.strip() == store)
+            registry[nm].Visible = (nm in target_layers)
         for nm in brand_logos:
             registry[nm].Visible = True
-        print(f"  门店 Logo: 显示 {store!r}，隐藏其余；品牌 Logo: 全部显示")
+        shown = target_layers if target_layers else "（无匹配，门店 Logo 全部隐藏）"
+        print(f"  门店 Logo: 显示 {store!r} -> {shown}；品牌 Logo: 全部显示")
 
         fname = f"{idx + 1:03d}_{sanitize(store)}_{sanitize(name)}.png"
         out_path = os.path.join(out_dir, fname)
