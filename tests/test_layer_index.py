@@ -442,3 +442,104 @@ def test_find_matching_ignores_spaces():
     m = idx.find_matching("姓名")   # 忽略空格
     assert len(m) == 1
     assert m[0].id == "0/0"
+
+
+# ---------------------------------------------------------------------------
+# 附加：stale 检测必须校验父链/特征，不能只看叶子 name（BLOCKED 问题 B）
+# ---------------------------------------------------------------------------
+def test_resolve_rejects_same_leaf_name_when_parent_path_changed():
+    """初始模板：GroupA>电话 与 GroupB>电话。
+    建立 ref = GroupA > 电话（index_path=(0,0)，name_path=("GroupA","电话")）。
+    结构变化后 GroupB 移到 GroupA 前面：
+        GroupB>电话  (0,0)
+        GroupA>电话  (0,1)
+    此时 (0,0) 仍然叫「电话」，但它已不是原来的 GroupA>电话。
+    resolve 必须识别为 STALE，而不是 VALID。"""
+    # 初始模板
+    doc = build_doc("d", {"GroupA": {"电话": "text"}, "GroupB": {"电话": "text"}})
+    idx = collect_layer_index(doc)
+    ref_a = idx.get("0/0")
+    assert ref_a.name_path == ("GroupA", "电话")
+    assert ref_a.display_path == "GroupA > 电话"
+    # 结构变化：GroupB 移到 GroupA 前面（整组互换位置，叶子同名保留）
+    doc2 = build_doc("d", {"GroupB": {"电话": "text"}, "GroupA": {"电话": "text"}})
+    idx2 = collect_layer_index(doc2)
+    # 验证 (0,0) 现在的名字确实还是「电话」——正是测试的难点
+    assert idx2.get("0/0").name == "电话"
+    # 但 old ref（指向 GroupA>电话，即原 (0,0)）必须判定为 STALE
+    with pytest.raises(LayerResolutionError) as ei:
+        idx2.resolve(doc2, ref_a)
+    assert "父链" in str(ei.value) or "STALE" in str(ei.value) or "不匹配" in str(ei.value)
+
+
+def test_resolve_rejects_when_parent_group_name_changed():
+    """父组名变化（GroupA->Renamed），叶子同名：父链不匹配 -> STALE。"""
+    doc = build_doc("d", {"GroupA": {"电话": "text"}})
+    idx = collect_layer_index(doc)
+    ref = idx.get("0/0")
+    assert ref.name_path == ("GroupA", "电话")
+    doc2 = build_doc("d", {"Renamed": {"电话": "text"}})
+    with pytest.raises(LayerResolutionError):
+        idx.resolve(doc2, ref)
+
+
+def test_resolve_rejects_when_ancestor_becomes_leaf():
+    """原父组 GroupA 变成普通图层（不再是组）-> 中间层非组 -> STALE。"""
+    doc = build_doc("d", {"GroupA": {"电话": "text"}})
+    idx = collect_layer_index(doc)
+    ref = idx.get("0/0")
+    # 结构变化：GroupA 现在是普通叶子，电话层消失
+    doc2 = build_doc("d", {"GroupA": None})
+    with pytest.raises(LayerResolutionError):
+        idx.resolve(doc2, ref)
+
+
+def test_resolve_checks_is_group_feature():
+    """ref 记录 is_group=True 但位置实际不是组 -> STALE。"""
+    doc = build_doc("d", {"G": {"电话": "text"}})
+    idx = collect_layer_index(doc)
+    ref = idx.get("0")
+    assert ref.is_group is True
+    # 结构变化：位置 (0) 变成普通叶子
+    doc2 = build_doc("d", {"G": None})
+    with pytest.raises(LayerResolutionError) as ei:
+        idx.resolve(doc2, ref)
+    assert "图层组" in str(ei.value)
+
+
+def test_resolve_checks_is_text_feature():
+    """ref 记录 is_text=True 但位置实际不是文字层 -> STALE。"""
+    doc = build_doc("d", {"电话": "text"})
+    idx = collect_layer_index(doc)
+    ref = idx.get("0")
+    assert ref.is_text is True
+    # 结构变化：位置 (0) 变成普通图层
+    doc2 = build_doc("d", {"电话": None})
+    with pytest.raises(LayerResolutionError) as ei:
+        idx.resolve(doc2, ref)
+    assert "文字图层" in str(ei.value)
+
+
+def test_resolve_valid_when_structure_unchanged_and_features_ok():
+    """结构未变 + 特征一致：仍 VALID（确保增强不破坏正常 resolve）。"""
+    doc = build_doc("d", {"GroupA": {"电话": "text"}, "GroupB": {"电话": "text"}})
+    idx = collect_layer_index(doc)
+    ref_a = idx.get("0/0")
+    layer = idx.resolve(doc, ref_a)
+    assert layer is doc.Layers[1].Layers[1]
+    assert layer.Name == "电话"
+
+
+def test_resolve_serialized_ref_keeps_name_path():
+    """serialize -> ref_from_config round-trip 后 name_path 保留，父链校验仍生效。"""
+    doc = build_doc("d", {"GroupA": {"电话": "text"}, "GroupB": {"电话": "text"}})
+    idx = collect_layer_index(doc)
+    ref = idx.get("0/0")
+    d = serialize_ref(ref)
+    assert d.get("name_path") == ["GroupA", "电话"]
+    back = ref_from_config(d)
+    assert back.name_path == ("GroupA", "电话")
+    # 序列化恢复后的 ref 在结构变化后同样识别 STALE
+    doc2 = build_doc("d", {"GroupB": {"电话": "text"}, "GroupA": {"电话": "text"}})
+    with pytest.raises(LayerResolutionError):
+        idx.resolve(doc2, back)

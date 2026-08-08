@@ -41,6 +41,8 @@ class LayerRef:
     index_path: tuple = ()     # 0-based tuple，如 (0, 2, 1)
     is_group: bool = False     # 是否为图层组（LayerSet）
     is_text: bool = False      # 是否为文字图层（有 TextItem）
+    name_path: tuple = ()      # 从根到该层的 name 链，如 ("文字", "Header", "电话")；
+                               # resolve 时逐层校验 ancestry（同名不同父 -> STALE）。
 
     def __post_init__(self):
         if not self.id:
@@ -63,8 +65,16 @@ class LayerResolutionError(Exception):
 def _layers_of(container):
     """返回容器（Document / LayerSet）的直接子图层列表。
 
-    遍历用 COM 1-based 下标（container.Layers[i], i 从 1 起），
+    遍历用 COM 1-based 下标（container.Layers(i), i 从 1 起），
     但 collect 时记录的 index_path 是 0-based（i-1）。
+
+    重要（Stage 2 调查结论 C7）：
+      - 必须用「方法调用形式」container.Layers(i) 访问 COM 集合；
+      - 绝不能用下标形式 container.Layers[i]（__getitem__ 走 win32com
+        内部缓存的 _NewEnum 快照，Add/删除图层后缓存不刷新，会把
+        不同 index 映射到同一底层对象 / 漏层，导致「同名层同步修改」
+        假象与结构错乱）；
+      - Layers(i) 每次触发实时 COM 调用，返回正确对象。
     """
     try:
         n = container.Layers.Count
@@ -72,10 +82,19 @@ def _layers_of(container):
         return []
     out = []
     for i in range(1, n + 1):
+        layer = None
+        # 1) 优先方法调用形式（COM：实时调用，避免缓存枚举 bug）
         try:
-            out.append(container.Layers[i])
+            layer = container.Layers(i)
         except Exception:
-            continue
+            layer = None
+        # 2) fake 模型（测试）：Layers 是 1-based 的 _LayerCollection（__getitem__）
+        if layer is None:
+            try:
+                layer = container.Layers[i]
+            except Exception:
+                continue
+        out.append(layer)
     return out
 
 
@@ -130,6 +149,7 @@ def collect_layer_index(document, max_depth=64):
                 index_path=cur_path,
                 is_group=is_group,
                 is_text=is_text,
+                name_path=tuple(cur_names),
             ))
             if is_group:
                 walk(layer, cur_path, cur_names)
@@ -145,9 +165,19 @@ def resolve_layer(document, layer_ref):
     """按 index_path 在 document 中精确定位 COM Layer。
 
     - 按 0-based index_path 逐层进入（访问 COM 时下标 +1）；
-    - 最后一步校验该位置 layer.Name 与 LayerRef.name 一致；
-    - 任一步骤失败（越界 / 中间层非组 / name 不匹配）抛 LayerResolutionError；
+    - 遍历途中同步重建该位置的实际 name 链，**逐层**校验与
+      LayerRef.name_path（缺失时由 display_path 反推）一致——
+      父路径已经不同（同名但父组换了位置）必须识别为 STALE，
+      仅校验叶子 name 对同名图层不充分；
+    - 末层校验 layer.Name 与 LayerRef.name 一致；
+    - 若 LayerRef 带 is_group / is_text 特征，末层一并校验；
+    - 任一步骤失败（越界 / 中间层非组 / name 链不匹配）抛 LayerResolutionError；
     - **绝不** fallback 到 find_layer(name) 取第一个同名层。
+
+    已知限制：若 index_path 对应位置的**整条 ancestry 与叶子 name 都与旧模板
+    完全重复**（例如两个组结构完全相同且整体互换位置），index_path 本身无法
+    证明永久身份——这属于模板结构指纹（template fingerprint）范畴，后续阶段处理；
+    但只要父路径/父链 name 不同，本函数必然识别为 STALE。
     """
     if layer_ref is None:
         raise LayerResolutionError("layer_ref 为 None", name=None)
@@ -157,27 +187,74 @@ def resolve_layer(document, layer_ref):
             f"LayerRef 没有 index_path（纯 name 引用 {layer_ref.name!r}，需先 rebind）",
             layer_id=layer_ref.id, name=layer_ref.name, index_path=path)
 
+    expected_path = _expected_name_path(layer_ref)
+
     container = document
     for pos, idx in enumerate(path):
+        # 0-based -> COM 1-based；优先方法调用形式（COM 实时），fallback 下标（fake 测试）
         try:
-            layer = container.Layers[idx + 1]   # 0-based -> COM 1-based
-        except Exception as exc:
-            raise LayerResolutionError(
-                f"index_path 第 {pos + 1} 层索引 {idx} 越界（共 "
-                f"{_count_layers(container)} 个子层）",
-                layer_id=layer_ref.id, name=layer_ref.name, index_path=path) from exc
+            layer = container.Layers(idx + 1)
+        except Exception:
+            try:
+                layer = container.Layers[idx + 1]
+            except Exception as exc:
+                raise LayerResolutionError(
+                    f"index_path 第 {pos + 1} 层索引 {idx} 越界（共 "
+                    f"{_count_layers(container)} 个子层）",
+                    layer_id=layer_ref.id, name=layer_ref.name, index_path=path) from exc
         if pos == len(path) - 1:
-            # 最后一层：校验 name
+            # 最后一层：校验叶子 name
             if not _name_matches(layer.Name, layer_ref.name):
                 raise LayerResolutionError(
                     f"index_path {path} 处图层名不匹配：期望 {layer_ref.name!r}，"
                     f"实际 {layer.Name!r}（PSD 结构可能已变化 → STALE）",
                     layer_id=layer_ref.id, name=layer_ref.name, index_path=path)
+            # 末层特征校验：is_group / is_text（仅当 ref 记录了两者中任一 True）
+            _verify_leaf_features(layer, layer_ref, path)
             return layer
-        # 中间层：继续进入其子层（若为非组，下一次 container.Layers 会抛异常 -> 越界错误）
+        # 中间层：逐层校验 ancestry name（父路径已变化 -> STALE）
+        if expected_path is not None and pos < len(expected_path):
+            if not _name_matches(layer.Name, expected_path[pos]):
+                raise LayerResolutionError(
+                    f"index_path {path} 第 {pos + 1} 层（父链）名字不匹配："
+                    f"期望 {expected_path[pos]!r}，实际 {layer.Name!r}"
+                    f"（父路径已变化 → STALE）",
+                    layer_id=layer_ref.id, name=layer_ref.name, index_path=path)
+        # 继续进入其子层（若为非组，下一次 container.Layers 会抛异常 -> 越界错误）
         container = layer
     raise LayerResolutionError("index_path 为空", layer_id=layer_ref.id,
                                name=layer_ref.name, index_path=path)
+
+
+def _expected_name_path(layer_ref):
+    """resolve 用的期望 name 链：优先 LayerRef.name_path，缺失时由 display_path 反推。
+    反推规则：display_path 以 ' > ' 分隔且段数与 index_path 一致才可用，否则返回 None
+    （None 表示「无 ancestry 信息，仅校验叶子 name」——兼容纯 name 迁移的旧引用）。"""
+    np = getattr(layer_ref, "name_path", ())
+    if np and len(np) == len(layer_ref.index_path):
+        return tuple(np)
+    dp = layer_ref.display_path or ""
+    if dp and len(layer_ref.index_path) >= 1:
+        parts = [p.strip() for p in dp.split(" > ")]
+        if len(parts) == len(layer_ref.index_path):
+            return tuple(parts)
+    return None
+
+
+def _verify_leaf_features(layer, layer_ref, path):
+    """末层特征校验：ref 记录 is_group / is_text 时，与实际图层比对。
+    只有 ref 特征为 True 时才严格校验（旧迁移引用特征为 False 时不强求，
+    避免破坏纯 name 旧配置迁移的可用性）。"""
+    if layer_ref.is_group:
+        if not _is_group(layer):
+            raise LayerResolutionError(
+                f"index_path {path} 处期望为图层组，实际不是（STALE）",
+                layer_id=layer_ref.id, name=layer_ref.name, index_path=path)
+    if layer_ref.is_text:
+        if not _is_text(layer):
+            raise LayerResolutionError(
+                f"index_path {path} 处期望为文字图层，实际不是（STALE）",
+                layer_id=layer_ref.id, name=layer_ref.name, index_path=path)
 
 
 def _count_layers(container):
@@ -229,13 +306,17 @@ def _rebase_by_name(index, name):
 # ---------------------------------------------------------------------------
 def serialize_ref(ref):
     """LayerRef -> JSON 可序列化 dict（不含任何 COM 对象）。"""
-    return {
+    d = {
         "layer_id": ref.id,
         "name": ref.name,
         "display_path": ref.display_path,
         "is_group": ref.is_group,
         "is_text": ref.is_text,
     }
+    np = getattr(ref, "name_path", ())
+    if np:
+        d["name_path"] = list(np)
+    return d
 
 
 def ref_from_config(v):
@@ -255,6 +336,11 @@ def ref_from_config(v):
                 ip = tuple(int(x) for x in str(iid).split("/"))
             except (TypeError, ValueError):
                 ip = ()
+        np = v.get("name_path") or ()
+        if isinstance(np, (list, tuple)):
+            np = tuple(str(x) for x in np)
+        else:
+            np = ()
         return LayerRef(
             id=str(iid) if iid else _id_of(ip),
             name=str(name),
@@ -262,6 +348,7 @@ def ref_from_config(v):
             index_path=ip,
             is_group=bool(v.get("is_group", False)),
             is_text=bool(v.get("is_text", False)),
+            name_path=np,
         )
     if isinstance(v, str) and v.strip():
         name = v.strip()
