@@ -128,13 +128,17 @@ TEXT_FIELD_LABELS = ("姓名", "电话", "销售顾问")
 PNG_FORMAT = "PNG"
 JPG_FORMAT = "JPG"
 PSD_FORMAT = "PSD"
-_SAVE_OPTIONS = {}
 
 
 def _save_option(fmt: str, com_dispatch):
-    """按格式创建 Photoshop SaveOptions（惰性缓存于模块级）。"""
-    if fmt in _SAVE_OPTIONS:
-        return _SAVE_OPTIONS[fmt]
+    """按格式创建 Photoshop SaveOptions。
+
+    **绝不做模块级/长期缓存**：SaveOptions 是 COM 对象（CDispatch），
+    绑定创建线程的 STA 单元。Preview（主线程）与 Batch（worker 线程）
+    各自创建、各自使用，跨线程复用已创建对象会抛
+    `CDispatch can not be converted to a COM VARIANT`。
+    因此每次导出都新建（与 Stage 5 前 export_doc 行为一致）。
+    """
     if fmt == PNG_FORMAT:
         opt = com_dispatch("Photoshop.PNGSaveOptions")
         opt.Interlaced = False
@@ -145,7 +149,6 @@ def _save_option(fmt: str, com_dispatch):
         opt.EmbedColorProfile = False
     else:  # PSD
         opt = com_dispatch("Photoshop.PhotoshopSaveOptions")
-    _SAVE_OPTIONS[fmt] = opt
     return opt
 
 

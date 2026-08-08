@@ -712,6 +712,33 @@ def test_export_document_psd_also_png(tmp_path):
     assert sorted(os.path.basename(p) for p in paths) == ["x.png", "x.psd"]
 
 
+def test_save_option_not_cached_across_calls(tmp_path):
+    """回归（Stage 5 打包后发现）：SaveOptions 必须每次新建，绝不模块级缓存。
+
+    真实 bug：_save_option 曾把 SaveOptions 缓存到模块级 _SAVE_OPTIONS，
+    Preview（主线程）创建并缓存后，Batch（worker 线程）复用同一 CDispatch
+    对象传给 SaveAs → `CDispatch can not be converted to a COM VARIANT`。
+    本测试用计数 Dispatch 断言每次导出都新建对象（跨调用无复用）。
+    """
+    from core.renderer import _save_option
+    calls = []
+
+    def counting_dispatch(progid):
+        obj = FakeDispatch(progid)
+        calls.append(progid)
+        return obj
+
+    o1 = _save_option("PNG", counting_dispatch)
+    o2 = _save_option("PNG", counting_dispatch)
+    o3 = _save_option("PSD", counting_dispatch)
+    # 每次调用都新建（不缓存）-> PNG 调了 2 次、PSD 1 次
+    assert calls == ["Photoshop.PNGSaveOptions", "Photoshop.PNGSaveOptions",
+                     "Photoshop.PhotoshopSaveOptions"]
+    # 返回对象不是同一个（跨调用无复用）
+    assert o1 is not o2
+    assert isinstance(o1, FakeDispatch) and isinstance(o3, FakeDispatch)
+
+
 def test_export_document_missing_file_raises(tmp_path):
     class _NoWrite(FakeDoc):
         def SaveAs(self, path, opt, as_copy=True):
