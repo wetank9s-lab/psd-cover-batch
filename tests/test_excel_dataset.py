@@ -652,6 +652,8 @@ def test_gui_store_column_change_rebuilds_mapping(tmp_path):
         app.col_name_cb = None
         app.col_phone_cb = None
         app.col_role_cb = None
+        # Stage 4.5：_set_column_options 现在也刷新分组列下拉
+        app.group_col_cb = None
         # _log_gui 用打印替代（避免依赖真实 tk 日志控件）
         def _fake_log(self, msg):
             pass

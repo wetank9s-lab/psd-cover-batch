@@ -43,6 +43,7 @@ from core.logo_mapping import (
 from core.excel_data import (
     ExcelRow, ExcelDataset, SkippedRow, ExcelDataError,
     load_excel_dataset, index_to_excel_column, excel_column_to_index,
+    resolve_group_subdir,
 )
 
 # ---------------- Photoshop 资源管理 ----------------
@@ -638,13 +639,20 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
                     safe_store = core_util.sanitize_filename(store)
                     safe_name = core_util.sanitize_filename(name)
                     base = f"{idx:03d}_{safe_store}_{safe_name}"
+                    # Stage 4.5：按 Excel 任意列分组输出子文件夹（Preview/Batch 同一规则）
+                    row_dir = out_dir
+                    if cfg.get("group_output_enabled") and cfg.get("group_output_column") is not None:
+                        sub = resolve_group_subdir(
+                            r, cfg["group_output_column"], fallback="未分组")
+                        row_dir = os.path.join(out_dir, sub)
+                        os.makedirs(row_dir, exist_ok=True)
                     if fmt == FMT_PSD:
-                        p = os.path.join(out_dir, base + ".psd")
+                        p = os.path.join(row_dir, base + ".psd")
                         export_doc(d, p, FMT_PSD)
                         if also_png:
-                            export_doc(d, os.path.join(out_dir, base + ".png"), FMT_PNG)
+                            export_doc(d, os.path.join(row_dir, base + ".png"), FMT_PNG)
                     else:
-                        p = os.path.join(out_dir, base + "." + fmt.lower())
+                        p = os.path.join(row_dir, base + "." + fmt.lower())
                         export_doc(d, p, fmt)
 
                     done += 1
@@ -768,6 +776,16 @@ class App:
         self.header_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="Excel 首行为表头（数据从第2行开始）",
                         variable=self.header_var).grid(row=3, column=1, sticky="w", pady=3)
+
+        # Stage 4.5：按 Excel 任意列创建输出子文件夹（group_output_enabled / group_output_column）
+        self.group_output_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="☑ 按 Excel 列创建输出子文件夹",
+                        variable=self.group_output_var).grid(row=4, column=1, sticky="w", pady=3)
+        ttk.Label(row, text="分组字段:").grid(row=4, column=2, sticky="e", pady=3)
+        self.group_col_var = tk.StringVar(value=cols[0] if cols else "A")
+        self.group_col_cb = ttk.Combobox(row, textvariable=self.group_col_var, values=cols,
+                                         width=14, state="readonly")
+        self.group_col_cb.grid(row=4, column=3, sticky="w", padx=4)
 
         # 字段映射（Stage 4：列下拉按实际工作表动态生成，这里只放默认 A..Z 兜底）
         mf = ttk.LabelFrame(parent, text="字段映射（选择 Excel 列）", padding=8)
@@ -978,7 +996,8 @@ class App:
         else:
             labels = cols
         self._column_labels = labels
-        for cb in (self.col_store_cb, self.col_name_cb, self.col_phone_cb, self.col_role_cb):
+        for cb in (self.col_store_cb, self.col_name_cb, self.col_phone_cb,
+                   self.col_role_cb, self.group_col_cb):
             if cb is not None:
                 cb["values"] = labels + (["（不替换）"] if cb is self.col_role_cb else [])
 
@@ -1517,6 +1536,9 @@ class App:
             "col_name": col_of(self.col_name_var.get()),
             "col_phone": col_of(self.col_phone_var.get()),
             "col_role": col_of(self.col_role_var.get()),
+            # Stage 4.5：按 Excel 任意列分组输出（内部保存 0-based index）
+            "group_output_enabled": bool(self.group_output_var.get()),
+            "group_output_column": col_of(self.group_col_var.get()) if self.group_output_var.get() else None,
             "text_map": text_map,
             # Stage 3 新字段（运行时唯一来源）
             "logo_selection": [ref_to_cfg(label)
@@ -1649,7 +1671,14 @@ class App:
                         if ok:
                             applied[ref.id] = visible
                     _verify_applied_visibility(d, index, plan, applied, self._log_gui)
-                    p = os.path.join(tmp, "preview.png")
+                    # Stage 4.5：预览与 Batch 使用同一分组目录解析规则
+                    p_dir = tmp
+                    if cfg.get("group_output_enabled") and cfg.get("group_output_column") is not None:
+                        sub = resolve_group_subdir(
+                            r, cfg["group_output_column"], fallback="未分组")
+                        p_dir = os.path.join(tmp, sub)
+                        os.makedirs(p_dir, exist_ok=True)
+                    p = os.path.join(p_dir, "preview.png")
                     export_doc(d, p, FMT_PNG)
                     self._log_gui(f"预览已生成：{p}")
                     try:
@@ -1715,6 +1744,13 @@ class App:
             self.col_phone_var.set(index_to_excel_column(c.get("col_phone", 3)))
             rv = c.get("col_role", 2)
             self.col_role_var.set("（不替换）" if rv < 0 else index_to_excel_column(rv))
+            # Stage 4.5：分组配置恢复（group_output_column 为 0-based index）
+            self.group_output_var.set(c.get("group_output_enabled", False))
+            gcol = c.get("group_output_column")
+            if gcol is not None:
+                self.group_col_var.set(index_to_excel_column(gcol))
+            elif self._column_labels:
+                self.group_col_var.set(self._column_labels[0])
             self.fmt_var.set(c.get("fmt", FMT_PNG))
             self.also_png_var.set(c.get("also_png", False))
             # 文字图层映射（加载后会在 _load 中按实际图层校正，这里仅预填）

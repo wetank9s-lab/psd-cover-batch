@@ -48,7 +48,7 @@ from core.logo_mapping import (
 # Stage 4：统一 Excel 数据管线（CLI 也统一走 load_excel_dataset）
 from core.excel_data import (
     ExcelRow, ExcelDataset, SkippedRow, ExcelDataError,
-    load_excel_dataset,
+    load_excel_dataset, resolve_group_subdir, excel_column_to_index,
 )
 
 # ============================================================
@@ -196,7 +196,8 @@ def inspect(psd_path, xlsx_path):
             # with 退出：Session 只关闭自己打开的 doc
 
 
-def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
+def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None,
+        group_output_column=None):
     os.makedirs(out_dir, exist_ok=True)
     # COM 初始化/反初始化由 PhotoshopSession 的 __enter__/__exit__ 统一负责
     with PhotoshopSession() as ps:
@@ -327,7 +328,13 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
                 print(f"  门店 Logo: {store!r} -> {shown}")
 
                 fname = f"{idx + 1:03d}_{sanitize(store)}_{sanitize(name)}.png"
-                out_path = os.path.join(out_dir, fname)
+                # Stage 4.5：按 Excel 任意列分组输出子文件夹（与 GUI 同一规则）
+                row_dir = out_dir
+                if group_output_column is not None:
+                    sub = resolve_group_subdir(r, group_output_column, fallback="未分组")
+                    row_dir = os.path.join(out_dir, sub)
+                    os.makedirs(row_dir, exist_ok=True)
+                out_path = os.path.join(row_dir, fname)
                 opts = win32com.client.Dispatch("Photoshop.PNGSaveOptions")
                 opts.Interlaced = False
                 com_call(doc.SaveAs, out_path, opts, True)  # asCopy=True，不改动原 PSD
@@ -343,6 +350,9 @@ def main():
     ap.add_argument("--xlsx", required=True, help="Excel 数据路径")
     ap.add_argument("--out", default="./out", help="PNG 输出目录")
     ap.add_argument("--row", type=int, default=0, help="只合成指定行（1 开始），0 表示全部")
+    ap.add_argument("--group-output-column", default=None,
+                    help="按 Excel 该列的值创建输出子文件夹（支持列字母如 AA 或 0-based 数字如 26）；"
+                         "不指定则不分组")
     ap.add_argument("--brand-logo", action="append", default=[],
                     help="品牌 Logo 图层名（每张封面都显示，如 七方logo）。可重复指定；不指定则自动识别名字含 logo 的图层")
     ap.add_argument("--inspect", action="store_true", help="只打印图层树后退出")
@@ -351,7 +361,22 @@ def main():
     if args.inspect:
         inspect(args.psd, args.xlsx)
         return
-    run(args.psd, args.xlsx, args.out, row=args.row or None, brand_logos=args.brand_logo or None)
+
+    # Stage 4.5：CLI 分组列（列字母或 0-based 数字 -> 0-based index）
+    group_col = None
+    if args.group_output_column is not None:
+        raw = str(args.group_output_column).strip()
+        if raw.isdigit():
+            group_col = int(raw)
+        else:
+            try:
+                group_col = excel_column_to_index(raw.upper())
+            except ValueError as e:
+                print(f"[参数错误] --group-output-column 无效：{e}")
+                return
+
+    run(args.psd, args.xlsx, args.out, row=args.row or None, brand_logos=args.brand_logo or None,
+        group_output_column=group_col)
 
 
 if __name__ == "__main__":
