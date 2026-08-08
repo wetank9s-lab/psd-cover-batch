@@ -335,6 +335,70 @@ def test_preview_name_does_not_pollute_batch(tmp_path):  # #scenario 32
     assert sorted(os.listdir(pdir)) == ["preview_张三.png"]
 
 
+def test_preview_and_batch_share_collision_folder_mapping(tmp_path):
+    """CONDITIONAL PASS 边界核验：Preview 与 Batch 在 collision 场景共享同一 folder mapping。
+
+    构造 dataset（group value 发生清洗碰撞）：
+      第1有效行 group value = A/B
+      第2有效行 group value = A\\B
+      第3有效行 group value = A:B
+    完整 batch folder map 必须：
+      A/B -> A_B
+      A\\B -> A_B_2
+      A:B -> A_B_3
+
+    Preview 与 Batch 必须都基于完整 dataset 建 map（build_group_folder_map(valid_rows)），
+    不能只针对 preview row 单独建 map（否则碰撞后缀不一致）。
+
+    验证：
+      - Batch row2 subdir   == A_B_2
+      - Preview row2 subdir == A_B_2
+      - Preview 完整路径位于 _preview/A_B_2
+      - Preview row3（三冲突）位于 _preview/A_B_3
+      - Preview 不污染正式目录
+    """
+    out = str(tmp_path / "out")
+    preview_base = os.path.join(out, "_preview")
+    # 真实 Excel（4 列：门店/姓名/电话/分组列）——分组值 A/B、A\B、A:B
+    ds = _ds(tmp_path, [
+        ["门店", "姓名", "电话", "分组"],
+        ["M1", "张三", 13800000001, "A/B"],
+        ["M2", "李四", 13800000002, "A\\B"],
+        ["M3", "王五", 13800000003, "A:B"],
+    ])
+    group_col = 3
+
+    # —— 完整 batch folder map（GUI run_batch / CLI run 都这样建）——
+    folder_map = build_group_folder_map(ds.valid_rows, group_col)
+    assert [folder_map.subdir_for(r, group_col) for r in ds.valid_rows] == \
+        ["A_B", "A_B_2", "A_B_3"]
+
+    # —— Batch（base=out_dir）：row2 -> out/A_B_2 ——
+    batch_row2 = resolve_output_directory(out, ds.valid_rows[1], group_col, folder_map=folder_map)
+    assert batch_row2 == os.path.join(out, "A_B_2")
+    # 与「只按单行建 map」的歧义实现对比：单行 map 会给 row2 无后缀的 A_B（证明差异存在）
+    single_map = build_group_folder_map([ds.valid_rows[1]], group_col)
+    assert single_map.subdir_for(ds.valid_rows[1], group_col) == "A_B"
+
+    # —— Preview（base=out_dir/_preview，同一 folder_map）：row2 -> _preview/A_B_2 ——
+    preview_row2 = resolve_output_directory(preview_base, ds.valid_rows[1], group_col,
+                                            folder_map=folder_map)
+    assert preview_row2 == os.path.join(preview_base, "A_B_2")
+    # 同一 ExcelRow 的 subdir 在 Batch 与 Preview 必须完全一致
+    assert os.path.basename(preview_row2) == os.path.basename(batch_row2) == "A_B_2"
+
+    # —— 三冲突：Preview row3 -> _preview/A_B_3 ——
+    preview_row3 = resolve_output_directory(preview_base, ds.valid_rows[2], group_col,
+                                            folder_map=folder_map)
+    assert preview_row3 == os.path.join(preview_base, "A_B_3")
+
+    # —— 预览不污染正式目录（out/A_B_2 只由 Batch 创建，无 preview 文件）——
+    assert os.path.isdir(batch_row2)            # Batch 目录存在
+    assert not os.path.exists(os.path.join(batch_row2, "preview.png"))
+    # 正式 out_dir 下不存在 A_B（碰撞行绝不落入无后缀目录）
+    assert not os.path.exists(os.path.join(out, "A_B"))
+
+
 # ---------------------------------------------------------------------------
 # 配置存取：old config 缺 group 字段 -> disabled；new config roundtrip；0-based
 # ---------------------------------------------------------------------------
