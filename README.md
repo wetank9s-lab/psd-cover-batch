@@ -115,6 +115,24 @@ venv314\Scripts\python.exe -m PyInstaller --onefile --windowed --name "七方视
 ```
 
 > 安装依赖时**不要** `pip install --upgrade pip`，否则部分沙箱环境会因删除旧包触发安全拦截导致失败；用 `--no-cache-dir` 即可。
+>
+> 注意：GUI 与 CLI 都依赖 `core/` 包（可测试纯函数）。**打包/运行时请保持仓库目录结构**
+> （`qifang_cover_maker.py` 与 `core/` 同级），PyInstaller 会自动收集 `core`。
+
+---
+
+## 开发 / 测试
+
+纯函数（文件名清洗、Excel 解析、门店/图层名匹配）位于 `core/`，**不依赖 Photoshop 与 tkinter**，
+可直接用 pytest 测试：
+
+```bash
+pip install pytest
+pytest tests/
+```
+
+当前测试：37 个用例（`tests/test_filename.py`、`tests/test_excel_parsing.py`、`tests/test_logo_matching.py`）。
+GUI 操作流程基线见 `docs/GUI_WORKFLOW.md`。
 
 ---
 
