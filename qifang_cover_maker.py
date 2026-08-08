@@ -19,8 +19,34 @@ import queue
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
+import ttkbootstrap as tb
+from ttkbootstrap import Style as TbStyle
+
 import win32com.client
 import pythoncom
+
+# Stage 6.5/6.5B：GUI 视觉层（spacing / theme / 字体 / 徽标 / tooltip / 滚动框架 / 纯逻辑 ViewModel）
+from gui_styles import (
+    APP_THEME, PAD_XS, PAD_SM, PAD_MD, PAD_LG, PAD_XL,
+    BS_MAIN, BS_SECONDARY, BS_DANGER, BS_OUTLINE,
+    BS_OUTLINE_SECONDARY,
+    BS_PRIMARY, BS_SUCCESS, BS_INFO, BS_WARNING,
+    add_tooltip, section, make_scrollable,
+    shorten_path, log_level_of,
+    APP_TITLE_TEXT, APP_SUBTITLE_TEXT,
+    FONT_TITLE, FONT_SUBTITLE, FONT_SECTION, FONT_BODY, FONT_HELP, FONT_LOG,
+    FONT_TAB, FONT_UI, FS_TAB, FS_BODY, FS_SECTION, FS_HELP,
+    FONT_SECTION_PLAIN,
+    section_help, make_separator, style_notebook, apply_global_fonts,
+)
+from gui_view_model import (
+    state_text, state_bootstyle, state_progress_mode,
+    mapping_status, mapping_review_needed,
+    filter_items, filter_logo_labels, filter_stores,
+    logo_display_state, progress_display, batch_summary_model,
+    summary_duration_text, config_check_model, state_line,
+    layer_display_label,
+)
 
 # Stage 0：引入 core 纯函数（不依赖 COM / Tk），保持行为一致，供测试与复用
 from core import util as core_util
@@ -670,8 +696,21 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
 class App:
     def __init__(self, root):
         self.root = root
+        # Stage 6.5：ttkbootstrap Window（tb.Window 是 tk.Tk 子类，接口兼容）
         root.title(APP_TITLE)
-        root.geometry("820x760")
+        # 规格第 30 节：默认 1050x780；第 33 节 1366x768 硬验收 ——
+        # 屏幕高度不足时（768 减任务栏 40px），自动压缩到可用高度，保证完整可用。
+        try:
+            sw = root.winfo_screenwidth()
+            sh = root.winfo_screenheight()
+            win_w = min(1050, max(980, sw - 80))
+            # 内容高 = 屏幕高 - 任务栏(40) - 标题栏(≈15)；下限 660 保证可用。
+            # 1366x768 -> 713（Tab1 固定内容堆叠不溢出，按钮区完整可见）
+            win_h = min(780, max(660, sh - 55))
+        except Exception:
+            win_w, win_h = 1050, 780
+        root.geometry(f"{win_w}x{win_h}")
+        root.minsize(980, 640)
         root.resizable(True, True)
 
         self.config_path = self._find_config_path()
@@ -720,6 +759,13 @@ class App:
         self._pending_close = False       # 窗口关闭请求
         self._start_polling()
 
+        # Stage 6.5B：注入统一字体体系 + Notebook 样式（litera 主题已由 main() 创建）
+        try:
+            apply_global_fonts(root.style)
+            style_notebook(root.style)
+        except Exception:
+            pass
+
         self._build_ui()
         # 初始状态应用 IDLE 控件规则（UI 构建后控件默认可点，需按状态机收口）
         from core.app_state import controls_for as _controls_for
@@ -736,7 +782,11 @@ class App:
 
     # ---------------- Stage 6：状态机 ----------------
     def _set_state(self, new_state):
-        """集中状态转换：校验 + 更新控件（仅 main thread 调用）。"""
+        """集中状态转换：校验 + 更新控件（仅 main thread 调用）。
+
+        Stage 6.5：视觉仍由 AppState + StateControls 决定（不复制状态机）；
+        本方法只把状态翻译为视觉（状态文本 / 徽标 / 进度模式）。
+        """
         from core.app_state import controls_for, transition
         from core.task_events import is_valid_transition
         old = self._state
@@ -746,10 +796,42 @@ class App:
             return
         self._state = new_state
         self._apply_controls(controls_for(new_state))
+        # Stage 6.5 视觉映射：AppState -> 状态文本 / 徽标 / 进度模式
+        self._apply_state_visual(new_state)
         self._log_gui(f"[状态] {old.value} -> {new_state.value}")
 
+    def _apply_state_visual(self, state):
+        """AppState -> 视觉呈现（仅 main thread；消费状态机，不复制状态机）。"""
+        from core.task_events import AppState
+        # 状态文字（含徽标色）
+        if hasattr(self, "status_label"):
+            self.status_label.config(text=state_line(state))
+        if hasattr(self, "status_badge"):
+            try:
+                # 徽标文本 + 颜色都随状态刷新（Stage 6.5 修复：此前 text 停留初始值）
+                self.status_badge.config(text=state_text(state),
+                                         bootstyle=state_bootstyle(state))
+            except Exception:
+                pass
+        # 进度条模式：LOADING/PREVIEWING 用 indeterminate，RUNNING 用 determinate
+        if hasattr(self, "progress") and self._state is not None:
+            mode = state_progress_mode(self._state)
+            try:
+                cur = str(self.progress.cget("mode"))
+                if cur != mode:
+                    self.progress.config(mode=mode)
+                    if mode == "indeterminate":
+                        self.progress.start(12)   # 仅 main thread 控制
+                    else:
+                        self.progress.stop()
+            except Exception:
+                pass
+
     def _apply_controls(self, c):
-        """把控件规则应用到 widget（仅 main thread）。"""
+        """把控件规则应用到 widget（仅 main thread）。
+
+        Stage 6.5：控件 enabled/disabled 仍完全由 StateControls 决定。
+        """
         def _set(btn, enabled):
             if btn is not None:
                 btn.config(state="normal" if enabled else "disabled")
@@ -772,9 +854,6 @@ class App:
             self.notebook.state(["disabled"] if not c.tabs_enabled else ["!disabled"])
         except Exception:
             pass
-        # 状态文字
-        if hasattr(self, "status_label"):
-            self.status_label.config(text=f"状态：{c.state_label}")
 
     def _start_polling(self):
         """启动事件队列轮询（仅一次）。"""
@@ -806,7 +885,10 @@ class App:
             self._log_gui(ev.payload)
         elif t == WorkerEvent.PROGRESS:
             self._update_progress(ev.payload.current, ev.payload.total,
-                                  phase=ev.payload.phase)
+                                  phase=ev.payload.phase,
+                                  excel_row=ev.payload.excel_row,
+                                  store=ev.payload.store,
+                                  name=ev.payload.name)
         elif t == WorkerEvent.ROW_STARTED:
             pass  # 日志已由 renderer 输出；如需可在此显示当前行
         elif t == WorkerEvent.ROW_FINISHED:
@@ -871,66 +953,103 @@ class App:
 
     # ---------------- UI 构建 ----------------
     def _build_ui(self):
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        # Stage 6.5B：顶部标题栏 + Notebook 三 Tab（规格第 6/7 节）
+        self._build_header(self.root)
+        self.notebook = ttk.Notebook(self.root, style="S65.TNotebook")
+        self.notebook.pack(fill="both", expand=True, padx=PAD_LG, pady=(PAD_XS, PAD_LG))
 
-        # Tab 1: 文件与列映射
-        f1 = ttk.Frame(self.notebook)
-        self.notebook.add(f1, text="① 文件与字段")
+        # Tab 1: 文件与数据
+        f1 = ttk.Frame(self.notebook, padding=(PAD_LG, PAD_MD))
+        self.notebook.add(f1, text="文件与数据", padding=(PAD_XS, PAD_SM))
         self._build_tab_files(f1)
 
         # Tab 2: Logo 映射
-        f2 = ttk.Frame(self.notebook)
-        self.notebook.add(f2, text="② 门店Logo映射")
+        f2 = ttk.Frame(self.notebook, padding=(PAD_LG, PAD_MD))
+        self.notebook.add(f2, text="Logo 映射", padding=(PAD_XS, PAD_SM))
         self._build_tab_logo(f2)
 
-        # Tab 3: 运行
-        f3 = ttk.Frame(self.notebook)
-        self.notebook.add(f3, text="③ 生成")
+        # Tab 3: 生成与导出
+        f3 = ttk.Frame(self.notebook, padding=(PAD_LG, PAD_MD))
+        self.notebook.add(f3, text="生成与导出", padding=(PAD_XS, PAD_SM))
         self._build_tab_run(f3)
 
+    def _build_header(self, parent):
+        """顶部标题栏（规格 6.5B 第 6 节）：标题 + 副标题 + 单个状态徽标。
+
+        不再重复显示「状态：等待配置 等待配置」——只保留一个徽标（文字 + 语义色）。
+        """
+        hdr = ttk.Frame(parent, padding=(PAD_XL, PAD_MD, PAD_XL, PAD_SM))
+        hdr.pack(fill="x")
+        left = ttk.Frame(hdr)
+        left.pack(side="left", fill="x", expand=True)
+        ttk.Label(left, text=APP_TITLE_TEXT, font=FONT_TITLE).pack(anchor="w")
+        tb.Label(left, text=APP_SUBTITLE_TEXT, bootstyle="secondary",
+                 font=FONT_SUBTITLE).pack(anchor="w", pady=(2, 0))
+        # 右侧单个状态徽标（AppState 视觉映射；_set_state -> _apply_state_visual 刷新）
+        right = ttk.Frame(hdr)
+        right.pack(side="right")
+        self.status_badge = tb.Label(right, text=state_text(self._state),
+                                     bootstyle=state_bootstyle(self._state),
+                                     font=FONT_BODY, padding=(PAD_MD, PAD_XS))
+        self.status_badge.pack(side="right")
+        # status_label 不再单独显示（徽标文字即状态）；保留属性兼容 _apply_state_visual
+        self.status_label = ttk.Label(right, text=state_text(self._state), font=FONT_BODY)
+        self.status_label.pack_forget()
+
     def _build_tab_files(self, parent):
-        # 文件选择
-        row = ttk.LabelFrame(parent, text="文件选择", padding=8)
-        row.pack(fill="x", padx=6, pady=6)
+        # ---- Section 一：文件与输出（规格 6.5B 第 5/8 节：无 Labelframe，标题+内容+Separator） ----
+        # 三行 Entry 严格对齐：label 固定宽 / Entry 占满 / 按钮固定宽
+        sec1 = ttk.Frame(parent)
+        sec1.pack(fill="x")
+        ttk.Label(sec1, text="文件与输出", font=FONT_SECTION).pack(anchor="w")
 
-        ttk.Label(row, text="PSD 模板:").grid(row=0, column=0, sticky="e", pady=3)
+        grid = ttk.Frame(sec1)
+        grid.pack(fill="x", pady=(PAD_XS, 0))
+        grid.columnconfigure(1, weight=1)   # Entry 列占满剩余
+
+        ttk.Label(grid, text="PSD 模板", font=FONT_BODY, width=10, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=PAD_XS)
         self.psd_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.psd_var, width=55).grid(row=0, column=1, padx=4)
-        self.btn_pick_psd = ttk.Button(row, text="浏览...", command=self._pick_psd)
-        self.btn_pick_psd.grid(row=0, column=2)
+        self.psd_entry = ttk.Entry(grid, textvariable=self.psd_var, font=FONT_BODY)
+        self.psd_entry.grid(row=0, column=1, padx=(PAD_SM, PAD_SM), sticky="we")
+        self.btn_pick_psd = tb.Button(grid, text="选择", command=self._pick_psd,
+                                      bootstyle=BS_OUTLINE_SECONDARY, width=8)
+        self.btn_pick_psd.grid(row=0, column=2, sticky="e")
 
-        ttk.Label(row, text="Excel 数据:").grid(row=1, column=0, sticky="e", pady=3)
+        ttk.Label(grid, text="Excel 数据", font=FONT_BODY, width=10, anchor="w").grid(
+            row=1, column=0, sticky="w", pady=PAD_XS)
         self.xlsx_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.xlsx_var, width=55).grid(row=1, column=1, padx=4)
-        self.btn_pick_xlsx = ttk.Button(row, text="浏览...", command=self._pick_xlsx)
-        self.btn_pick_xlsx.grid(row=1, column=2)
+        self.xlsx_entry = ttk.Entry(grid, textvariable=self.xlsx_var, font=FONT_BODY)
+        self.xlsx_entry.grid(row=1, column=1, padx=(PAD_SM, PAD_SM), sticky="we")
+        self.btn_pick_xlsx = tb.Button(grid, text="选择", command=self._pick_xlsx,
+                                       bootstyle=BS_OUTLINE_SECONDARY, width=8)
+        self.btn_pick_xlsx.grid(row=1, column=2, sticky="e")
 
-        ttk.Label(row, text="输出目录:").grid(row=2, column=0, sticky="e", pady=3)
+        ttk.Label(grid, text="输出目录", font=FONT_BODY, width=10, anchor="w").grid(
+            row=2, column=0, sticky="w", pady=PAD_XS)
         self.out_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.out_var, width=55).grid(row=2, column=1, padx=4)
-        self.btn_pick_out = ttk.Button(row, text="浏览...", command=self._pick_out)
-        self.btn_pick_out.grid(row=2, column=2)
+        self.out_entry = ttk.Entry(grid, textvariable=self.out_var, font=FONT_BODY)
+        self.out_entry.grid(row=2, column=1, padx=(PAD_SM, PAD_SM), sticky="we")
+        self.btn_pick_out = tb.Button(grid, text="选择", command=self._pick_out,
+                                      bootstyle=BS_OUTLINE_SECONDARY, width=8)
+        self.btn_pick_out.grid(row=2, column=2, sticky="e")
 
         # Stage 4：has_header 默认 True（已有 config 优先，见 _load_config）
         self.header_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="Excel 首行为表头（数据从第2行开始）",
-                        variable=self.header_var).grid(row=3, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(grid, text="第一行为表头", variable=self.header_var).grid(row=3, column=1, sticky="w", pady=(PAD_XS, 0))
+        section_help(grid, "数据从第 2 行开始读取").grid(
+            row=3, column=2, sticky="w")
 
-        # Stage 4.5：按 Excel 任意列创建输出子文件夹（group_output_enabled / group_output_column）
-        self.group_output_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="☑ 按 Excel 列创建输出子文件夹",
-                        variable=self.group_output_var).grid(row=4, column=1, sticky="w", pady=3)
-        ttk.Label(row, text="分组字段:").grid(row=4, column=2, sticky="e", pady=3)
-        # 默认列值：下方 cols（A..Z）才定义，这里用字面量 "A"（加载后按实际列刷新）
-        self.group_col_var = tk.StringVar(value="A")
-        self.group_col_cb = ttk.Combobox(row, textvariable=self.group_col_var, values=["A"],
-                                         width=14, state="readonly")
-        self.group_col_cb.grid(row=4, column=3, sticky="w", padx=4)
+        make_separator(parent, pady=PAD_XS)
 
-        # 字段映射（Stage 4：列下拉按实际工作表动态生成，这里只放默认 A..Z 兜底）
-        mf = ttk.LabelFrame(parent, text="字段映射（选择 Excel 列）", padding=8)
-        mf.pack(fill="x", padx=6, pady=6)
+        # ---- Section 二：数据字段（规格 6.5B 第 8 节） ----
+        sec2 = ttk.Frame(parent)
+        sec2.pack(fill="x")
+        ttk.Label(sec2, text="数据字段", font=FONT_SECTION).pack(anchor="w")
+        mf = ttk.Frame(sec2)
+        mf.pack(fill="x", pady=(PAD_XS, 0))
+        mf.columnconfigure(1, weight=1)
+        mf.columnconfigure(3, weight=1)
 
         cols = [index_to_excel_column(i) for i in range(26)]  # A..Z（加载后按实际列数刷新）
         self.col_store_var = tk.StringVar(value="A")
@@ -939,162 +1058,295 @@ class App:
         self.col_role_var = tk.StringVar(value="C")
         self._column_labels = cols
 
-        ttk.Label(mf, text="门店列（用于选 Logo）:").grid(row=0, column=0, sticky="e", pady=3)
+        ttk.Label(mf, text="门店", font=FONT_BODY, width=10, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=PAD_XS)
         self.col_store_cb = ttk.Combobox(mf, textvariable=self.col_store_var, values=cols,
-                                         width=8, state="readonly")
-        self.col_store_cb.grid(row=0, column=1, padx=4, sticky="w")
-        ttk.Label(mf, text="姓名列:").grid(row=0, column=2, sticky="e", pady=3)
+                                         width=12, state="readonly", font=FONT_BODY)
+        self.col_store_cb.grid(row=0, column=1, padx=(PAD_SM, PAD_LG), sticky="w")
+        ttk.Label(mf, text="姓名", font=FONT_BODY, width=10, anchor="w").grid(
+            row=0, column=2, sticky="w", pady=PAD_XS)
         self.col_name_cb = ttk.Combobox(mf, textvariable=self.col_name_var, values=cols,
-                                        width=8, state="readonly")
-        self.col_name_cb.grid(row=0, column=3, padx=4, sticky="w")
-        ttk.Label(mf, text="电话列:").grid(row=1, column=0, sticky="e", pady=3)
+                                        width=12, state="readonly", font=FONT_BODY)
+        self.col_name_cb.grid(row=0, column=3, padx=(PAD_SM, 0), sticky="w")
+        ttk.Label(mf, text="电话", font=FONT_BODY, width=10, anchor="w").grid(
+            row=1, column=0, sticky="w", pady=PAD_XS)
         self.col_phone_cb = ttk.Combobox(mf, textvariable=self.col_phone_var, values=cols,
-                                         width=8, state="readonly")
-        self.col_phone_cb.grid(row=1, column=1, padx=4, sticky="w")
-        ttk.Label(mf, text="销售顾问列:").grid(row=1, column=2, sticky="e", pady=3)
-        self.col_role_cb = ttk.Combobox(mf, textvariable=self.col_role_var, values=cols + ["（不替换）"],
-                                        width=12, state="readonly")
-        self.col_role_cb.grid(row=1, column=3, padx=4, sticky="w")
+                                         width=12, state="readonly", font=FONT_BODY)
+        self.col_phone_cb.grid(row=1, column=1, padx=(PAD_SM, PAD_LG), sticky="w")
+        ttk.Label(mf, text="销售顾问", font=FONT_BODY, width=10, anchor="w").grid(
+            row=1, column=2, sticky="w", pady=PAD_XS)
+        self.col_role_cb = ttk.Combobox(mf, textvariable=self.col_role_var,
+                                        values=cols + ["（不替换）"], width=12,
+                                        state="readonly", font=FONT_BODY)
+        self.col_role_cb.grid(row=1, column=3, padx=(PAD_SM, 0), sticky="w")
 
-        ttk.Label(mf, text="提示：销售顾问列选「不替换」则保留 PSD 原文字。").grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        section_help(mf, "选「不替换」则保留 PSD 原文字").grid(
+            row=2, column=1, columnspan=3, sticky="w")
 
-        # 文字图层映射（PSD 内实际文字图层 -> 字段）
-        tf = ttk.LabelFrame(parent, text="文字图层映射（PSD 内实际文字图层，加载后自动识别）", padding=8)
-        tf.pack(fill="x", padx=6, pady=6)
+        make_separator(parent, pady=PAD_XS)
+
+        # ---- Section 三：输出分组 ----
+        sec3 = ttk.Frame(parent)
+        sec3.pack(fill="x")
+        ttk.Label(sec3, text="输出分组", font=FONT_SECTION).pack(anchor="w")
+        gf = ttk.Frame(sec3)
+        gf.pack(fill="x", pady=(PAD_XS, 0))
+        gf.columnconfigure(1, weight=1)
+
+        # Stage 4.5：按 Excel 任意列创建输出子文件夹（group_output_enabled / group_output_column）
+        self.group_output_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(gf, text="按字段创建子文件夹", variable=self.group_output_var).grid(row=0, column=0, sticky="w", pady=PAD_XS)
+        ttk.Label(gf, text="分组字段", font=FONT_BODY, width=10, anchor="w").grid(
+            row=0, column=1, sticky="w", pady=PAD_XS)
+        self.group_col_var = tk.StringVar(value="A")
+        self.group_col_cb = ttk.Combobox(gf, textvariable=self.group_col_var, values=["A"],
+                                         width=14, state="readonly", font=FONT_BODY)
+        self.group_col_cb.grid(row=0, column=2, sticky="w", padx=(PAD_SM, 0))
+        section_help(gf, "示例：输出目录 / 门店名 / 001_张三.png").grid(
+            row=1, column=1, columnspan=2, sticky="w")
+
+        make_separator(parent, pady=PAD_XS)
+
+        # ---- Section 四：文字图层 ----
+        sec4 = ttk.Frame(parent)
+        sec4.pack(fill="x")
+        ttk.Label(sec4, text="文字图层", font=FONT_SECTION).pack(anchor="w")
+        tf = ttk.Frame(sec4)
+        tf.pack(fill="x", pady=(PAD_XS, 0))
+        tf.columnconfigure(1, weight=1)
+        tf.columnconfigure(3, weight=1)
 
         self.tm_name_var = tk.StringVar(value="（不替换）")
         self.tm_phone_var = tk.StringVar(value="（不替换）")
         self.tm_role_var = tk.StringVar(value="（不替换）")
         tm_opts = ["（不替换）"]
 
-        ttk.Label(tf, text="姓名 →").grid(row=0, column=0, sticky="e", pady=3)
+        ttk.Label(tf, text="姓名", font=FONT_BODY, width=10, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=PAD_XS)
         self.tm_name_cb = ttk.Combobox(tf, textvariable=self.tm_name_var, values=tm_opts,
-                                       width=30, state="readonly")
-        self.tm_name_cb.grid(row=0, column=1, padx=4, sticky="w")
-        ttk.Label(tf, text="电话 →").grid(row=0, column=2, sticky="e", pady=3)
+                                       width=24, state="readonly", font=FONT_BODY)
+        self.tm_name_cb.grid(row=0, column=1, padx=(PAD_SM, PAD_LG), sticky="w")
+        ttk.Label(tf, text="电话", font=FONT_BODY, width=10, anchor="w").grid(
+            row=0, column=2, sticky="w", pady=PAD_XS)
         self.tm_phone_cb = ttk.Combobox(tf, textvariable=self.tm_phone_var, values=tm_opts,
-                                        width=30, state="readonly")
-        self.tm_phone_cb.grid(row=0, column=3, padx=4, sticky="w")
-        ttk.Label(tf, text="销售顾问 →").grid(row=1, column=0, sticky="e", pady=3)
+                                        width=24, state="readonly", font=FONT_BODY)
+        self.tm_phone_cb.grid(row=0, column=3, padx=(PAD_SM, 0), sticky="w")
+        ttk.Label(tf, text="销售顾问", font=FONT_BODY, width=10, anchor="w").grid(
+            row=1, column=0, sticky="w", pady=PAD_XS)
         self.tm_role_cb = ttk.Combobox(tf, textvariable=self.tm_role_var, values=tm_opts,
-                                       width=30, state="readonly")
-        self.tm_role_cb.grid(row=1, column=1, padx=4, sticky="w")
+                                       width=24, state="readonly", font=FONT_BODY)
+        self.tm_role_cb.grid(row=1, column=1, padx=(PAD_SM, PAD_LG), sticky="w")
 
-        ttk.Label(tf, text="提示：若 PSD 内文字层名与「姓名/电话/销售顾问」不同（如带空格），"
-                            "在此手动指定；没有对应图层请保持「不替换」。").grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        section_help(tf, "图层名与默认不同时在此手动指定；没有对应图层保持「不替换」").grid(
+            row=2, column=1, columnspan=3, sticky="w")
 
-        # 加载按钮
+        make_separator(parent, pady=PAD_XS)
+
+        # ---- 加载按钮区（规格 6.5B 第 20/21 节：主按钮 primary + 次要 outline） ----
         bf = ttk.Frame(parent)
-        bf.pack(fill="x", padx=6, pady=6)
-        self.btn_load = ttk.Button(bf, text="加载 PSD / Excel 并分析图层", command=self._load)
+        bf.pack(fill="x")
+        self.btn_load = tb.Button(bf, text="加载并分析",
+                                  command=self._load, bootstyle=BS_MAIN, padding=(PAD_LG, PAD_SM))
         self.btn_load.pack(side="left")
-        ttk.Button(bf, text="保存配置", command=self._save_config).pack(side="left", padx=6)
+        self.btn_save_cfg = tb.Button(bf, text="保存配置", command=self._save_config,
+                                      bootstyle=BS_OUTLINE_SECONDARY)
+        self.btn_save_cfg.pack(side="left", padx=(PAD_SM, 0))
+        # 文件数据状态反馈（规格 6.5B 第 11 节：轻量单行，secondary 文字）
+        self.file_status = tb.Label(bf, text="", bootstyle="secondary",
+                                    font=FONT_HELP, padding=(PAD_SM, 0))
+        self.file_status.pack(side="left", padx=(PAD_SM, 0))
 
     def _build_tab_logo(self, parent):
-        info = ttk.Label(parent, text="先到「① 文件与字段」点击【加载】按钮，解析出 PSD 图层与 Excel 门店后再配置。")
-        info.pack(fill="x", padx=8, pady=8)
+        # 顶部说明行（规格 6.5B 第 12 节：一句话说明，secondary）
+        info = tb.Label(parent,
+                        text="选择参与生成的 Logo，并为每个门店指定对应图层",
+                        bootstyle="secondary", font=FONT_HELP, padding=(PAD_XS, 2))
+        info.pack(fill="x", pady=(0, PAD_XS))
         self.logo_info = info
 
-        # 左右分栏
+        # 搜索行（规格 6.5B 第 15 节：placeholder 短文案，只过滤不修改映射；清空恢复）
+        sbar = ttk.Frame(parent)
+        sbar.pack(fill="x", pady=(0, PAD_SM))
+        sbar.columnconfigure(1, weight=1)
+        sbar.columnconfigure(3, weight=1)
+        ttk.Label(sbar, text="搜索 Logo 图层", font=FONT_BODY).grid(
+            row=0, column=0, sticky="w")
+        self.logo_search_var = tk.StringVar()
+        self.logo_search_var.trace_add("write", lambda *a: self._refresh_logo_filtered())
+        self.logo_search_entry = ttk.Entry(sbar, textvariable=self.logo_search_var,
+                                           font=FONT_BODY)
+        self.logo_search_entry.grid(row=0, column=1, sticky="we", padx=(PAD_SM, PAD_LG))
+        ttk.Label(sbar, text="搜索门店", font=FONT_BODY).grid(
+            row=0, column=2, sticky="w")
+        self.store_search_var = tk.StringVar()
+        self.store_search_var.trace_add("write", lambda *a: self._refresh_store_filtered())
+        self.store_search_entry = ttk.Entry(sbar, textvariable=self.store_search_var,
+                                            font=FONT_BODY)
+        self.store_search_entry.grid(row=0, column=3, sticky="we", padx=(PAD_SM, 0))
+
+        # 左右分栏（规格 6.5B 第 12 节：保持双栏）
         paned = ttk.PanedWindow(parent, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=6, pady=6)
+        paned.pack(fill="both", expand=True, pady=(0, PAD_XS))
 
         left = ttk.Frame(paned)
         right = ttk.Frame(paned)
         paned.add(left, weight=1)
         paned.add(right, weight=1)
 
-        # 左：Logo 图层清单（可勾选）
-        lf = ttk.LabelFrame(left, text="标记为 Logo 图层（PSD 内的候选 Logo）", padding=6)
-        lf.pack(fill="both", expand=True, padx=4, pady=4)
-        self.logo_canvas = tk.Canvas(lf)
-        self.logo_scroll = ttk.Scrollbar(lf, orient="vertical", command=self.logo_canvas.yview)
-        self.logo_inner = ttk.Frame(self.logo_canvas)
-        self.logo_inner.bind("<Configure>", lambda e: self.logo_canvas.configure(
-            scrollregion=self.logo_canvas.bbox("all")))
-        self.logo_canvas.create_window((0, 0), window=self.logo_inner, anchor="nw")
-        self.logo_canvas.configure(yscrollcommand=self.logo_scroll.set)
-        self.logo_canvas.pack(side="left", fill="both", expand=True)
-        self.logo_scroll.pack(side="right", fill="y")
+        # 左：Logo 图层清单（规格 6.5B：无边框 section 标题 + 滚动区）
+        lsec = ttk.Frame(left)
+        lsec.pack(fill="both", expand=True)
+        ttk.Label(lsec, text="Logo 图层", font=FONT_SECTION).pack(anchor="w")
+        self.logo_scroll = make_scrollable(lsec, height=0)
+        self.logo_scroll.pack(fill="both", expand=True, pady=(PAD_XS, 0))
+        self.logo_inner = self.logo_scroll.inner
         self.logo_checks = {}  # name -> BooleanVar
+        # label -> 展示标记（selected/brand）徽标缓存，便于搜索刷新时更新
+        self.logo_badges = {}
 
         # 右：门店 -> Logo 映射
-        rf = ttk.LabelFrame(right, text="门店 → Logo 图层 映射", padding=6)
-        rf.pack(fill="both", expand=True, padx=4, pady=4)
+        rsec = ttk.Frame(right)
+        rsec.pack(fill="both", expand=True)
+        ttk.Label(rsec, text="门店映射", font=FONT_SECTION).pack(anchor="w")
 
-        # 品牌 Logo 人工指定（Stage 3 补充）：
-        #   「固定品牌 Logo」= 每张封面强制显示的叶子（如 七方logo / 圣大）。
-        #   独立于门店映射：勾选 selected 只是候选集合，不等于 brand；
-        #   这里人工勾选某个 leaf 才真正把它写入 brand_logo_refs。
-        bf2 = ttk.LabelFrame(rf, text="固定品牌 Logo（每张封面都显示；勾选 = 人工指定 BRAND）",
-                             padding=4)
-        bf2.pack(fill="x", padx=4, pady=(0, 4))
-        self.brand_canvas = tk.Canvas(bf2, height=90)
-        self.brand_scroll = ttk.Scrollbar(bf2, orient="vertical", command=self.brand_canvas.yview)
-        self.brand_inner = ttk.Frame(self.brand_canvas)
-        self.brand_inner.bind("<Configure>", lambda e: self.brand_canvas.configure(
-            scrollregion=self.brand_canvas.bbox("all")))
-        self.brand_canvas.create_window((0, 0), window=self.brand_inner, anchor="nw")
-        self.brand_canvas.configure(yscrollcommand=self.brand_scroll.set)
-        self.brand_canvas.pack(side="left", fill="both", expand=True)
-        self.brand_scroll.pack(side="right", fill="y")
+        # 固定显示（规格 6.5B 第 13 节：禁止内部术语 BRAND，改「固定显示」）
+        bsec = ttk.Frame(rsec)
+        bsec.pack(fill="x", pady=(PAD_XS, 0))
+        ttk.Label(bsec, text="固定显示", font=FONT_SECTION_PLAIN).pack(anchor="w")
+        self.brand_scroll = make_scrollable(bsec, height=92)
+        self.brand_scroll.pack(fill="x", expand=False, pady=(PAD_XS, 0))
+        self.brand_inner = self.brand_scroll.inner
+        section_help(bsec, "勾选后将在每张封面中保持显示").pack(anchor="w", pady=(PAD_XS, 0))
 
-        self.map_canvas = tk.Canvas(rf)
-        self.map_scroll = ttk.Scrollbar(rf, orient="vertical", command=self.map_canvas.yview)
-        self.map_inner = ttk.Frame(self.map_canvas)
-        self.map_inner.bind("<Configure>", lambda e: self.map_canvas.configure(
-            scrollregion=self.map_canvas.bbox("all")))
-        self.map_canvas.create_window((0, 0), window=self.map_inner, anchor="nw")
-        self.map_canvas.configure(yscrollcommand=self.map_scroll.set)
-        self.map_canvas.pack(side="left", fill="both", expand=True)
-        self.map_scroll.pack(side="right", fill="y")
+        self.map_scroll = make_scrollable(rsec, height=0)
+        self.map_scroll.pack(fill="both", expand=True, pady=(PAD_XS, 0))
+        self.map_inner = self.map_scroll.inner
         self.map_combos = {}  # store -> StringVar
         self.map_combo_widgets = {}  # store -> Combobox widget
+        self.map_badges = {}  # store -> tb.Label 状态徽标
+
+    # ---- 搜索刷新（只过滤显示，不改数据；规格第 13/14 节） ----
+    def _refresh_logo_filtered(self):
+        """图层搜索：只改 View 中可见的勾选列表（不改变 logo_checks 数据）。"""
+        query = self.logo_search_var.get() if hasattr(self, "logo_search_var") else ""
+        labels = self.all_psd_layers_labels()
+        display_path_of = {}
+        if self.layer_index is not None:
+            display_path_of = {self.layer_labels[r.id]: r.display_path
+                               for r in self.layer_index.layers}
+        visible = filter_logo_labels(labels, query, display_path_of)
+        self._rebuild_logo_list_rows(visible)
+
+    def _refresh_store_filtered(self):
+        """门店搜索：只过滤显示（不删除 mapping 数据；规格第 14 节）。"""
+        query = self.store_search_var.get() if hasattr(self, "store_search_var") else ""
+        visible = filter_stores(self.excel_stores, query)
+        self._rebuild_map_rows(visible)
 
     def _build_tab_run(self, parent):
-        # 选项
-        opt = ttk.LabelFrame(parent, text="导出选项", padding=8)
-        opt.pack(fill="x", padx=6, pady=6)
+        # ---- Section 一：输出格式（规格 6.5B 第 16 节） ----
+        sec1 = ttk.Frame(parent)
+        sec1.pack(fill="x")
+        ttk.Label(sec1, text="输出格式", font=FONT_SECTION).pack(anchor="w")
+        opt = ttk.Frame(sec1)
+        opt.pack(fill="x", pady=(PAD_XS, 0))
         self.fmt_var = tk.StringVar(value=FMT_PNG)
-        ttk.Label(opt, text="导出格式:").grid(row=0, column=0, sticky="e", pady=3)
-        ttk.Combobox(opt, textvariable=self.fmt_var, values=[FMT_PNG, FMT_JPG, FMT_PSD],
-                     width=8, state="readonly").grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(opt, text="格式", font=FONT_BODY, width=10, anchor="w").grid(
+            row=0, column=0, sticky="w")
+        self.fmt_cb = ttk.Combobox(opt, textvariable=self.fmt_var,
+                                   values=[FMT_PNG, FMT_JPG, FMT_PSD],
+                                   width=10, state="readonly", font=FONT_BODY)
+        self.fmt_cb.grid(row=0, column=1, sticky="w", padx=(PAD_SM, PAD_LG))
         self.also_png_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt, text="导出 PSD 时另外再生成 PNG（便于预览）",
-                        variable=self.also_png_var).grid(row=0, column=2, sticky="w", padx=10)
+        ttk.Checkbutton(opt, text="PSD 同时保存 PNG", variable=self.also_png_var).grid(row=0, column=2, sticky="w")
 
-        # 进度
-        pf = ttk.Frame(parent)
-        pf.pack(fill="x", padx=6, pady=4)
-        self.progress = ttk.Progressbar(pf, mode="determinate", maximum=100)
+        make_separator(parent)
+
+        # ---- Section 二：生成准备（配置检查 inline 列表，规格 6.5B 第 16 节） ----
+        sec2 = ttk.Frame(parent)
+        sec2.pack(fill="x")
+        head2 = ttk.Frame(sec2)
+        head2.pack(fill="x")
+        ttk.Label(head2, text="生成准备", font=FONT_SECTION).pack(side="left")
+        self.btn_check_cfg = tb.Button(head2, text="检查配置", command=self._check_config,
+                                       bootstyle=BS_OUTLINE_SECONDARY)
+        self.btn_check_cfg.pack(side="right")
+        self.cfg_check_box = ttk.Frame(sec2)
+        self.cfg_check_box.pack(fill="x", pady=(PAD_XS, 0))
+        self._render_cfg_check_placeholder()
+
+        make_separator(parent)
+
+        # ---- Section 三：当前任务（进度，规格 6.5B 第 16/19 节） ----
+        sec3 = ttk.Frame(parent)
+        sec3.pack(fill="x")
+        ttk.Label(sec3, text="当前任务", font=FONT_SECTION).pack(anchor="w")
+        pf = ttk.Frame(sec3)
+        pf.pack(fill="x", pady=(PAD_XS, 0))
+        # 第一行：进度条（主题 Primary）+ 百分比 + 78/221
+        row1 = ttk.Frame(pf)
+        row1.pack(fill="x")
+        self.progress = ttk.Progressbar(row1, mode="determinate", maximum=100,
+                                        style="primary.Horizontal.TProgressbar")
         self.progress.pack(fill="x", side="left", expand=True)
-        self.progress_label = ttk.Label(pf, text="0 / 0")
-        self.progress_label.pack(side="left", padx=6)
+        self.progress_pct = tb.Label(row1, text="0%", bootstyle="secondary",
+                                     font=FONT_BODY, width=6)
+        self.progress_pct.pack(side="left", padx=(PAD_SM, 0))
+        self.progress_label = tb.Label(row1, text="0 / 0", bootstyle="primary",
+                                       font=FONT_BODY)
+        self.progress_label.pack(side="left", padx=(PAD_SM, 0))
+        # 第二行：门店 · 姓名 + 阶段
+        row2 = ttk.Frame(pf)
+        row2.pack(fill="x", pady=(PAD_XS, 0))
+        self.progress_cur = tb.Label(row2, text="", bootstyle="secondary", font=FONT_BODY)
+        self.progress_cur.pack(side="left")
+        self.progress_phase = tb.Label(row2, text="", bootstyle="info", font=FONT_BODY)
+        self.progress_phase.pack(side="left", padx=(PAD_SM, 0))
 
-        # 按钮
+        # ---- 按钮区（规格 6.5B 第 20/21 节：主按钮 primary / 停止 danger / 预览 outline） ----
         bf = ttk.Frame(parent)
-        bf.pack(fill="x", padx=6, pady=4)
-        self.btn_run = ttk.Button(bf, text="▶ 开始生成", command=self._start)
+        bf.pack(fill="x", pady=(PAD_MD, 0))
+        self.btn_run = tb.Button(bf, text="开始生成", command=self._start,
+                                 bootstyle=BS_MAIN,
+                                 padding=(PAD_LG, PAD_SM))
         self.btn_run.pack(side="left")
-        self.btn_stop = ttk.Button(bf, text="■ 停止", command=self._stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=6)
-        self.btn_preview = ttk.Button(bf, text="🖼 试做第1张预览", command=self._preview)
-        self.btn_preview.pack(side="left", padx=6)
+        self.btn_preview = tb.Button(bf, text="生成预览", command=self._preview,
+                                     bootstyle=BS_OUTLINE_SECONDARY)
+        self.btn_preview.pack(side="left", padx=(PAD_SM, 0))
+        self.btn_stop = tb.Button(bf, text="停止", command=self._stop,
+                                  bootstyle=BS_DANGER, state="disabled")
+        self.btn_stop.pack(side="left", padx=(PAD_SM, 0))
 
-        # 状态文字（Stage 6）
-        sf = ttk.Frame(parent)
-        sf.pack(fill="x", padx=6, pady=4)
-        self.status_label = ttk.Label(sf, text="状态：空闲")
-        self.status_label.pack(side="left")
+        make_separator(parent)
 
-        # 日志
-        lf = ttk.LabelFrame(parent, text="运行日志", padding=6)
-        lf.pack(fill="both", expand=True, padx=6, pady=6)
-        self.log = scrolledtext.ScrolledText(lf, height=12, state="disabled",
-                                             font=("Consolas", 9))
-        self.log.pack(fill="both", expand=True)
+        # ---- Section 四：本次结果（空状态精简，规格 6.5B 第 17 节） ----
+        sec4 = ttk.Frame(parent)
+        sec4.pack(fill="x")
+        ttk.Label(sec4, text="本次结果", font=FONT_SECTION).pack(anchor="w")
+        self.summary_box = ttk.Frame(sec4)
+        self.summary_box.pack(fill="x", pady=(PAD_XS, 0))
+        self._render_summary_placeholder()
+
+        # ---- Section 五：运行日志（规格 6.5B：允许保留的大区域框——日志文本区） ----
+        sec5 = ttk.Frame(parent)
+        sec5.pack(fill="both", expand=True, pady=(PAD_MD, 0))
+        head5 = ttk.Frame(sec5)
+        head5.pack(fill="x")
+        ttk.Label(head5, text="运行日志", font=FONT_SECTION).pack(side="left")
+        tbrow = ttk.Frame(head5)
+        tbrow.pack(side="right")
+        self.btn_log_clear = tb.Button(tbrow, text="清空", command=self._log_clear,
+                                       bootstyle=BS_OUTLINE_SECONDARY)
+        self.btn_log_clear.pack(side="left")
+        self.btn_log_copy = tb.Button(tbrow, text="复制", command=self._log_copy,
+                                      bootstyle=BS_OUTLINE_SECONDARY)
+        self.btn_log_copy.pack(side="left", padx=(PAD_XS, 0))
+        self.btn_log_open = tb.Button(tbrow, text="打开目录", command=self._log_open_dir,
+                                      bootstyle=BS_OUTLINE_SECONDARY)
+        self.btn_log_open.pack(side="left", padx=(PAD_XS, 0))
+        self.log = scrolledtext.ScrolledText(sec5, height=10, state="disabled",
+                                             font=FONT_LOG, relief="solid", borderwidth=1)
+        self.log.pack(fill="both", expand=True, pady=(PAD_XS, 0))
 
     # ---------------- 文件选择 ----------------
     def _pick_psd(self):
@@ -1301,9 +1553,37 @@ class App:
         self.tm_role_var.set(self._label_of_text(tdef.get("销售顾问")) or "（不替换）")
         self._init_logo_checks(index)
         self._rebuild_logo_lists()
+        # Stage 6.5 修复（基线遗留）：Load 完成后同步构建 GUI 侧 excel_dataset，
+        # 使 _start/_preview 的分组预检能拿到 max_columns（此前始终 None -> 分组被误拦截）。
+        # worker 已验证 xlsx 有效；此处直接 load_excel_dataset 同步读取（不弹窗，静默兜底）。
+        try:
+            if self.excel_dataset is None and os.path.exists(
+                    self.xlsx_var.get().strip()):
+                ds = load_excel_dataset(
+                    self.xlsx_var.get().strip(),
+                    has_header=self.header_var.get(),
+                    col_store=self._col_of(self.col_store_var.get()),
+                    col_name=self._col_of(self.col_name_var.get()),
+                    col_phone=self._col_of(self.col_phone_var.get()),
+                    col_role=self._col_of(self.col_role_var.get()),
+                )
+                self.excel_dataset = ds
+                self._ds_key = self._ds_cache_key()
+                self._set_column_options(ds.max_columns)
+                self.excel_headers = [index_to_excel_column(i)
+                                      for i in range(ds.max_columns)]
+                self.excel_stores = ds.stores
+        except Exception:
+            pass
         stores = self.excel_stores
         self._log_gui(f"解析完成：PSD 共 {len(index)} 个图层，Excel 共 {len(stores)} 个门店。")
-        self.logo_info.config(text=f"PSD 图层 {len(index)} 个 ｜ Excel 门店 {len(stores)} 个 ｜ 请在下方勾选 Logo 并完成映射。")
+        # 规格 6.5B 第 11 节：轻量单行状态（不拆多个冗长提示）
+        try:
+            self.file_status.config(
+                text=f"✓ Excel 已读取 · {len(stores)} 条数据 · {len(set(stores))} 个门店")
+        except Exception:
+            pass
+        self.logo_info.config(text="请在下方勾选 Logo 并为每个门店指定对应图层")
         self._set_state(AppState.READY)
 
     def _label_of_text(self, display_path):
@@ -1469,61 +1749,209 @@ class App:
         return out
 
     def _rebuild_logo_lists(self):
-        # 清空
-        for w in self.logo_inner.winfo_children():
-            w.destroy()
-        for w in self.map_inner.winfo_children():
-            w.destroy()
-        for w in self.brand_inner.winfo_children():
-            w.destroy()
+        """全量重建 Logo 页（Stage 6.5：搜索区保留，列表行走拆分渲染）。"""
         self.map_combo_widgets = {}
         self.brand_widgets = {}
+        self.logo_badges = {}
+        self.map_badges = {}
+        self._rebuild_brand_list()
+        self._refresh_logo_filtered()
+        self._refresh_store_filtered()
 
-        ttk.Label(self.logo_inner, text="☑ 图层（显示完整路径）", font=("Microsoft YaHei", 9, "bold")).grid(
-            row=0, column=0, sticky="w", padx=4, pady=2)
-        for i, label in enumerate(self.logo_checks.keys(), start=1):
-            cb = ttk.Checkbutton(self.logo_inner, text=label, variable=self.logo_checks[label])
-            cb.grid(row=i, column=0, sticky="w", padx=4, pady=1)
-            # 勾选状态变化时，同步刷新右侧门店→Logo 下拉列表
-            self.logo_checks[label].trace_add(
-                "write", lambda *a: self._on_logo_checks_changed())
+    # ---- Logo 图层行渲染（规格第 13/16/17 节） ----
+    def _rebuild_logo_list_rows(self, visible_labels):
+        """按 visible_labels 重建左侧 Logo 勾选列表（含 selected/brand 徽标 + 完整路径）。"""
+        for w in self.logo_inner.winfo_children():
+            w.destroy()
+        self.logo_badges = {}
+        ttk.Label(self.logo_inner, text="☑ 图层（完整路径）",
+                  font=FONT_SECTION_PLAIN).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=PAD_XS, pady=PAD_XS)
+        if not visible_labels:
+            tb.Label(self.logo_inner, text="（无匹配图层）", bootstyle="secondary",
+                     font=FONT_HELP).grid(
+                row=1, column=0, columnspan=3, sticky="w", padx=PAD_XS, pady=2)
+            return
+        for i, label in enumerate(visible_labels, start=1):
+            var = self.logo_checks.get(label)
+            if var is None:
+                var = tk.BooleanVar(value=False)
+                self.logo_checks[label] = var
+            # selected vs brand 视觉区分（规格 6.5B 第 13 节：固定/参与/候选）
+            selected = bool(var.get())
+            is_brand = bool((self.brand_checks.get(label) or tk.BooleanVar(value=False)).get())
+            disp = logo_display_state(label, selected, is_brand)
+            if is_brand:
+                badge_bs = BS_PRIMARY
+            elif selected:
+                badge_bs = BS_SUCCESS
+            else:
+                badge_bs = BS_SECONDARY
+            # 完整路径：label + 父路径（缩短显示，tooltip 全路径）
+            cb = ttk.Checkbutton(self.logo_inner, text=label, variable=var)
+            cb.grid(row=i, column=0, sticky="w", padx=PAD_XS, pady=1)
+            badge = tb.Label(self.logo_inner, text=disp, bootstyle=badge_bs,
+                             font=FONT_HELP, padding=(PAD_XS, 0))
+            badge.grid(row=i, column=1, sticky="w", padx=(0, PAD_XS))
+            self.logo_badges[label] = badge
+            # 完整路径：优先显示 display_path（label 已是最终形式，路径给 tooltip）
+            full = ""
+            if self.layer_index is not None and label in self.logo_label_to_ref:
+                ref = self.logo_label_to_ref[label]
+                full = getattr(ref, "display_path", "") or ""
+            elif self.layer_index is not None:
+                for r in self.layer_index.layers:
+                    if self.layer_labels.get(r.id) == label:
+                        full = getattr(r, "display_path", "") or ""
+                        break
+            if full:
+                path_lbl = ttk.Label(self.logo_inner, text=shorten_path(full, 52),
+                                     foreground="#888888", font=FONT_HELP)
+                path_lbl.grid(row=i, column=2, sticky="w", padx=(0, PAD_XS))
+                add_tooltip(path_lbl, full)
+            else:
+                ttk.Label(self.logo_inner, text="", font=FONT_BODY).grid(
+                    row=i, column=2, sticky="w")
+            # 勾选状态变化 -> 同步右侧映射 + 刷新徽标（trace 去重：避免搜索重建累积）
+            if not self._has_trace(self.logo_checks[label], "write"):
+                self.logo_checks[label].trace_add(
+                    "write", lambda *a: self._on_logo_checks_changed())
 
-        # ---- 品牌 Logo 人工指定（Stage 3 补充）----
-        # 可选项 = 当前 effective 叶子（勾选的候选集合）；勾选 = 该 leaf 是固定品牌。
-        # 语义：selected 只是候选集合，不等于 brand；这里人工勾选才真正写入 brand。
+    @staticmethod
+    def _has_trace(var, mode):
+        """StringVar.trace_info 判重。
+
+        trace_info() 返回 [( (mode,), callback_id ), ...]（mode 可能是 'write'/'w'）。
+        """
+        try:
+            infos = var.trace_info()
+            for modes, _cid in infos:
+                for m in modes:
+                    if m == mode or m == mode[0]:
+                        return True
+            return False
+        except Exception:
+            return False
+
+    # ---- 门店映射行渲染（规格第 14/15 节） ----
+    def _rebuild_map_rows(self, visible_stores):
+        """按 visible_stores 重建右侧门店→Logo 下拉 + 状态徽标（不删除数据）。"""
+        for w in self.map_inner.winfo_children():
+            w.destroy()
+        self.map_badges = {}
+        ttk.Label(self.map_inner, text="门店", font=FONT_SECTION_PLAIN).grid(
+            row=0, column=0, sticky="w", padx=PAD_XS, pady=PAD_XS)
+        ttk.Label(self.map_inner, text="→ Logo 图层", font=FONT_SECTION_PLAIN).grid(
+            row=0, column=1, sticky="w", padx=PAD_XS, pady=PAD_XS)
+        ttk.Label(self.map_inner, text="状态", font=FONT_SECTION_PLAIN).grid(
+            row=0, column=2, sticky="w", padx=PAD_XS, pady=PAD_XS)
+        if not visible_stores:
+            tb.Label(self.map_inner, text="（无匹配门店）", bootstyle="secondary",
+                     font=FONT_HELP).grid(
+                row=1, column=0, columnspan=3, sticky="w", padx=PAD_XS, pady=2)
+            return
+        logo_opts = ["（无）"] + self._effective_logo_layers()
+        for i, s in enumerate(visible_stores, start=1):
+            ttk.Label(self.map_inner, text=s, font=FONT_BODY).grid(
+                row=i, column=0, sticky="w", padx=PAD_XS, pady=1)
+            var = self.map_combos.get(s)
+            if var is None:
+                var = tk.StringVar(value="（无）")
+                self.map_combos[s] = var
+            cb = ttk.Combobox(self.map_inner, textvariable=var, values=logo_opts,
+                              width=32, state="readonly", font=FONT_BODY)
+            cb.grid(row=i, column=1, sticky="w", padx=PAD_XS, pady=1)
+            self.map_combo_widgets[s] = cb
+            # 状态徽标（规格 6.5B 第 14 节：✓已匹配 / ●手动 / ⚠待确认 / ✕未映射）
+            badge = self._make_map_badge(s, var.get())
+            badge.grid(row=i, column=2, sticky="w", padx=(0, PAD_XS))
+            self.map_badges[s] = badge
+            # 下拉变化 -> 刷新徽标 + 品牌冲突联动（trace 去重：避免搜索重建累积）
+            if not self._has_trace(var, "write"):
+                var.trace_add("write", lambda *a, st=s: self._on_map_changed(st))
+
+    def _make_map_badge(self, store, mapped_label):
+        """根据映射状态生成徽标（规格 6.5B 第 14 节）。auto_matched 由 core 自动匹配判定。"""
+        auto_matched = self._is_auto_matched(store, mapped_label)
+        text, bs = mapping_status(store, mapped_label, auto_matched)
+        return tb.Label(self.map_inner, text=text, bootstyle=bs,
+                        font=FONT_HELP, padding=(PAD_XS, 0))
+
+    def _is_auto_matched(self, store, mapped_label):
+        """判定该门店映射是否来自自动匹配（EXACT/AUTO）。"""
+        if not mapped_label or mapped_label == "（无）" or self.layer_index is None:
+            return False
+        try:
+            from core.logo_mapping import match_store_logo
+            eff = self._effective_logo_refs_internal()
+            mr = match_store_logo(store, eff)
+            return mr.status in ("exact", "auto") and mr.best is not None \
+                and self.layer_labels.get(mr.best.id) == mapped_label
+        except Exception:
+            return False
+
+    def _effective_logo_refs_internal(self):
+        """当前 effective 叶子 LayerRef 列表（供自动匹配判定）。"""
+        out = []
+        for label in self._effective_logo_layers():
+            ref = self._label_to_ref(label)
+            if ref is not None:
+                out.append(ref)
+        return out
+
+    def _on_map_changed(self, store):
+        """门店下拉变化：刷新徽标 + 清除该 leaf 的 brand 冲突提示。"""
+        mapped = self.map_combos[store].get() if store in self.map_combos else "（无）"
+        if store in self.map_badges:
+            badge = self._make_map_badge(store, mapped)
+            self.map_badges[store].grid_forget()
+            badge.grid(row=self._map_row_of(store), column=2, sticky="w", padx=(0, PAD_XS))
+            self.map_badges[store] = badge
+        # 若该 leaf 已被 brand 指定 -> 提示冲突（与 _on_brand_toggle 对称）
+        if mapped and mapped != "（无）":
+            for label, bvar in self.brand_checks.items():
+                if bvar.get() and label == mapped:
+                    self._log_gui(f"注意：图层「{mapped}」同时被选为门店 Logo 与固定品牌。")
+
+    def _map_row_of(self, store):
+        """当前可见门店列表中的行号（用于徽标刷新定位）。"""
+        for i, s in enumerate(self.excel_stores, start=1):
+            if s == store:
+                return i
+        return 1
+
+    # ---- 固定显示区渲染（规格 6.5B 第 13 节：禁 BRAND 术语，改「固定显示」） ----
+    def _rebuild_brand_list(self):
+        """重建固定显示 Logo 勾选区。
+
+        可选项 = 当前 effective 叶子（勾选的候选集合）；勾选 = 该 leaf 是固定显示。
+        语义：selected 只是候选集合，不等于固定显示；这里人工勾选才真正写入 brand。
+        """
+        for w in self.brand_inner.winfo_children():
+            w.destroy()
+        self.brand_widgets = {}
         eff_labels = self._effective_logo_layers()
         if not eff_labels:
-            ttk.Label(self.brand_inner, text="（先勾选左侧 Logo 图层后，这里可指定品牌）",
-                      foreground="#888").grid(row=0, column=0, sticky="w", padx=4, pady=2)
-        else:
-            ttk.Label(self.brand_inner, text="☑ 固定品牌 Logo（叶子）",
-                      font=("Microsoft YaHei", 9, "bold")).grid(
-                row=0, column=0, sticky="w", padx=4, pady=2)
-            for i, label in enumerate(eff_labels, start=1):
-                # 该 leaf 若已被某门店映射为 store target，标记（冲突提示用）
-                store_owner = self._store_owner_of_leaf(label)
-                suffix = f"（门店:{store_owner}）" if store_owner else ""
-                var = self.brand_checks.get(label, tk.BooleanVar(value=False))
-                var.set(var.get())   # 保持既有状态
-                cb = ttk.Checkbutton(
-                    self.brand_inner, text=label + suffix, variable=var,
-                    command=lambda lb=label: self._on_brand_toggle(lb))
-                cb.grid(row=i, column=0, sticky="w", padx=4, pady=1)
-                self.brand_widgets[label] = cb
-                self.brand_checks[label] = var
-
-        # 映射表
-        ttk.Label(self.map_inner, text="门店", font=("Microsoft YaHei", 9, "bold")).grid(
-            row=0, column=0, sticky="w", padx=4, pady=2)
-        ttk.Label(self.map_inner, text="→ Logo 图层", font=("Microsoft YaHei", 9, "bold")).grid(
-            row=0, column=1, sticky="w", padx=4, pady=2)
-        logo_opts = ["（无）"] + self._effective_logo_layers()
-        for i, s in enumerate(self.excel_stores, start=1):
-            ttk.Label(self.map_inner, text=s).grid(row=i, column=0, sticky="w", padx=4, pady=1)
-            cb = ttk.Combobox(self.map_inner, textvariable=self.map_combos[s],
-                              values=logo_opts, width=40, state="readonly")
-            cb.grid(row=i, column=1, sticky="w", padx=4, pady=1)
-            self.map_combo_widgets[s] = cb
+            ttk.Label(self.brand_inner,
+                      text="（先勾选左侧 Logo 图层后，这里可指定固定显示）",
+                      foreground="#888888", font=FONT_HELP).grid(
+                row=0, column=0, sticky="w", padx=PAD_XS, pady=2)
+            return
+        ttk.Label(self.brand_inner, text="☑ 固定显示（叶子）",
+                  font=FONT_SECTION_PLAIN).grid(
+            row=0, column=0, sticky="w", padx=PAD_XS, pady=2)
+        for i, label in enumerate(eff_labels, start=1):
+            # 该 leaf 若已被某门店映射为 store target，标记（冲突提示用）
+            store_owner = self._store_owner_of_leaf(label)
+            suffix = f"（门店:{store_owner}）" if store_owner else ""
+            var = self.brand_checks.get(label, tk.BooleanVar(value=False))
+            var.set(var.get())   # 保持既有状态
+            cb = ttk.Checkbutton(
+                self.brand_inner, text=label + suffix, variable=var,
+                command=lambda lb=label: self._on_brand_toggle(lb))
+            cb.grid(row=i, column=0, sticky="w", padx=PAD_XS, pady=1)
+            self.brand_widgets[label] = cb
+            self.brand_checks[label] = var
 
     def _store_owner_of_leaf(self, label):
         """返回把该 leaf 选为门店 Logo 的门店名（无则空）。冲突提示用。"""
@@ -1754,19 +2182,157 @@ class App:
         self._set_state(AppState.READY)
 
     def _on_batch_done(self, summary):
-        """Batch done (main thread): 显示汇总（Summary 来自结构化 BATCH_DONE payload）。"""
+        """Batch done (main thread): 页面内 Summary（BatchResult 唯一数据源，规格第 23/24 节）。"""
         from core.task_events import AppState
         s = summary or {}
         self._log_gui(
             f"批量完成：成功 {s.get('success', 0)}，失败 {s.get('failed', 0)}，"
-            f"跳过 {s.get('skipped', 0)}，耗时 {s.get('duration_seconds', 0):.1f}s"
+            f"跳过 {s.get('skipped', 0)}，耗时 {summary_duration_text(s.get('duration_seconds', 0))}"
             + ("（已停止）" if s.get("cancelled") else ""))
+        # 页面内 Summary（规格第 23/24 节：BatchResult 唯一数据源）
+        self._render_summary(s)
         # 若仍有失败，列出明细
         for r in s.get("rows", []):
             if r.get("status") == "FAILED" and r.get("errors"):
                 self._log_gui(f"  [失败 行{r.get('excel_row')}] {'；'.join(r['errors'])}")
         # Batch 单行失败 ≠ GUI ERROR：回 READY（Stage 6 #24）
         self._set_state(AppState.READY)
+
+    # ---------------- Summary 渲染（规格 6.5B 第 17/18 节） ----------------
+    def _render_summary_placeholder(self):
+        """初始占位（未执行时显示简单灰字，不占大高度）。"""
+        for w in self.summary_box.winfo_children():
+            w.destroy()
+        section_help(self.summary_box, "尚未开始生成").pack(anchor="w")
+
+    def _render_summary(self, summary):
+        """把 BatchResult summary dict 渲染为页面内 Summary 卡片（唯一数据源）。"""
+        for w in self.summary_box.winfo_children():
+            w.destroy()
+        m = batch_summary_model(summary)
+        # 标题行：headline + 徽标
+        head = ttk.Frame(self.summary_box)
+        head.pack(fill="x")
+        tb.Label(head, text=m["headline"], bootstyle=m["bootstyle"],
+                 font=FONT_BODY, padding=(PAD_SM, PAD_XS)).pack(side="left")
+        dur = summary_duration_text(m["duration_seconds"])
+        tb.Label(head, text=f"耗时 {dur}", bootstyle="secondary",
+                 font=FONT_HELP).pack(side="left", padx=(PAD_SM, 0))
+        # 统计行：成功 / 失败 / 跳过（数字用语义色）
+        stats = ttk.Frame(self.summary_box)
+        stats.pack(fill="x", pady=(PAD_XS, 0))
+        tb.Label(stats, text=f"成功 {m['success']}", bootstyle=BS_SUCCESS,
+                 font=FONT_BODY).pack(side="left")
+        tb.Label(stats, text=f"失败 {m['failed']}",
+                 bootstyle=(BS_DANGER if m["failed"] else BS_SECONDARY),
+                 font=FONT_BODY).pack(side="left", padx=(PAD_SM, 0))
+        tb.Label(stats, text=f"跳过 {m['skipped']}", bootstyle=BS_SECONDARY,
+                 font=FONT_BODY).pack(side="left", padx=(PAD_SM, 0))
+        # 输出目录行（规格 6.5B 第 18 节）+ 打开输出目录
+        out_dir = ""
+        if summary:
+            out_dir = (summary.get("out_dir") or summary.get("output_dir") or "")
+        if out_dir:
+            outrow = ttk.Frame(self.summary_box)
+            outrow.pack(fill="x", pady=(PAD_XS, 0))
+            tb.Label(outrow, text="输出目录", bootstyle="secondary",
+                     font=FONT_HELP).pack(side="left")
+            tb.Label(outrow, text=shorten_path(out_dir, 70), bootstyle="secondary",
+                     font=FONT_HELP).pack(side="left", padx=(PAD_SM, 0))
+            self.btn_open_out = tb.Button(outrow, text="打开输出目录",
+                                          command=lambda: self._open_out_dir(out_dir),
+                                          bootstyle=BS_OUTLINE_SECONDARY)
+            self.btn_open_out.pack(side="left", padx=(PAD_SM, 0))
+        # 失败明细（有失败时展示，最多 8 行，其余进日志）
+        if m["rows_failed"]:
+            fl = ttk.Frame(self.summary_box)
+            fl.pack(fill="x", pady=(PAD_XS, 0))
+            tb.Label(fl, text="失败明细：", bootstyle=BS_DANGER,
+                     font=FONT_HELP).pack(side="left", anchor="n")
+            inner = ttk.Frame(fl)
+            inner.pack(side="left", fill="x", expand=True)
+            for rf in m["rows_failed"][:8]:   # 最多展示 8 行，其余进日志
+                who = rf.get("name") or rf.get("store") or f"行{rf.get('excel_row')}"
+                tb.Label(inner, text=f"· {who}：{'；'.join(rf['errors'])[:80]}",
+                         bootstyle="secondary", font=FONT_HELP,
+                         anchor="w").pack(fill="x")
+            if len(m["rows_failed"]) > 8:
+                tb.Label(inner, text=f"… 其余 {len(m['rows_failed']) - 8} 行见日志",
+                         bootstyle="secondary", font=FONT_HELP).pack(fill="x")
+
+    def _open_out_dir(self, out_dir):
+        """打开输出目录（不存在则用系统默认目录兜底）。"""
+        target = out_dir if out_dir and os.path.isdir(out_dir) else os.getcwd()
+        try:
+            os.startfile(target)
+        except Exception as e:
+            self._log_gui(f"打开目录失败：{e}")
+
+    # ---------------- 配置检查（规格第 18 节：inline 列表） ----------------
+    def _render_cfg_check_placeholder(self):
+        for w in self.cfg_check_box.winfo_children():
+            w.destroy()
+        tb.Label(self.cfg_check_box, text="点击「检查配置」查看是否满足生成条件。",
+                 bootstyle="secondary").pack(side="left")
+
+    def _check_config(self):
+        """配置检查：只读检查 + inline 列表展示（非弹窗；规格第 18 节）。"""
+        from core.task_events import AppState
+        cfg = self._collect_cfg()
+        # 分组列标签（展示用）：group_output_column 是 0-based 索引，转列字母
+        gcol_label = ""
+        if cfg.get("group_output_enabled") and cfg.get("group_output_column") is not None:
+            gcol_label = index_to_excel_column(cfg.get("group_output_column"))
+        items = config_check_model(
+            cfg, layer_index_loaded=self.layer_index is not None,
+            stores=self.excel_stores,
+            text_map={"姓名": cfg.get("text_map", {}).get("姓名", "")},
+            store_logo_map=cfg.get("store_logo_map", {}),
+            ds_valid_rows=len(self.excel_stores) if self.excel_stores else None,
+            group_enabled=cfg.get("group_output_enabled", False),
+            group_column_label=gcol_label,
+        )
+        for w in self.cfg_check_box.winfo_children():
+            w.destroy()
+        grid = self.cfg_check_box
+        for i, it in enumerate(items):
+            tb.Label(grid, text=it["label"], bootstyle="secondary", width=12, anchor="w").grid(
+                row=i, column=0, sticky="w", padx=(0, PAD_XS), pady=1)
+            ok_badge = tb.Label(grid, text="✓" if it["ok"] else "✕",
+                                bootstyle=(BS_SUCCESS if it["ok"] else BS_DANGER),
+                                padding=(PAD_XS, 0))
+            ok_badge.grid(row=i, column=1, sticky="w", padx=(0, PAD_XS), pady=1)
+            tb.Label(grid, text=shorten_path(str(it["detail"]), 60), bootstyle="secondary",
+                     anchor="w").grid(row=i, column=2, sticky="w", pady=1)
+        # 全部 ok -> 绿色提示；否则提示未就绪（不弹窗）
+        if all(it["ok"] for it in items):
+            tb.Label(grid, text="全部就绪，可以开始生成。", bootstyle=BS_SUCCESS).grid(
+                row=len(items), column=0, columnspan=3, sticky="w", pady=(PAD_XS, 0))
+        else:
+            tb.Label(grid, text="部分未就绪，请按上述提示调整。", bootstyle=BS_WARNING).grid(
+                row=len(items), column=0, columnspan=3, sticky="w", pady=(PAD_XS, 0))
+
+    # ---------------- 日志工具栏（规格第 25 节） ----------------
+    def _log_clear(self):
+        self.log.config(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.config(state="disabled")
+
+    def _log_copy(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.log.get("1.0", "end-1c"))
+        except Exception as e:
+            self._log_gui(f"复制日志失败：{e}")
+
+    def _log_open_dir(self):
+        """打开日志输出目录（输出目录或当前目录）。"""
+        out = self.out_var.get().strip() if hasattr(self, "out_var") else ""
+        target = out if out and os.path.isdir(out) else os.getcwd()
+        try:
+            os.startfile(target)
+        except Exception as e:
+            self._log_gui(f"打开目录失败：{e}")
 
     def _stop(self):
         """协作式取消：RUNNING -> STOPPING，set cancel_event（不杀线程/Photoshop）。"""
@@ -1780,18 +2346,34 @@ class App:
         """v1.1.0 兼容保留（不再使用）。"""
         pass
 
-    def _update_progress(self, done, total, phase=""):
+    def _update_progress(self, done, total, phase="", excel_row=0, store="", name=""):
+        # 规格第 20/21/22 节：78/221 + 35% + 门店·姓名 + 阶段
+        pm = progress_display(done, total, phase)
         if total > 0:
-            self.progress["value"] = int(done / total * 100)
-        txt = f"{done} / {total}"
-        if phase:
-            txt += f"（{phase}）"
-        self.progress_label.config(text=txt)
+            self.progress["value"] = pm["percent"]
+            self.progress_pct.config(text=f"{pm['percent']}%")
+        else:
+            self.progress["value"] = 0
+            self.progress_pct.config(text="")
+        self.progress_label.config(text=pm["text"])
+        cur_parts = []
+        if store:
+            cur_parts.append(store)
+        if name:
+            cur_parts.append(name)
+        self.progress_cur.config(text=" · ".join(cur_parts))
+        self.progress_phase.config(text=pm["phase_text"])
 
-
-    def _log_gui(self, msg):
+    def _log_gui(self, msg, level=""):
+        """写日志（规格第 25/26 节：INFO/WARN/ERROR 视觉区分）。"""
+        if not level:
+            level = log_level_of(msg)
         self.log.config(state="normal")
-        self.log.insert("end", msg + "\n")
+        tag = f"log_{level}"
+        self.log.tag_configure("log_error", foreground="#c0392b")
+        self.log.tag_configure("log_warn", foreground="#b9770e")
+        self.log.tag_configure("log_info", foreground="#2c3e50")
+        self.log.insert("end", msg + "\n", (tag,))
         self.log.see("end")
         self.log.config(state="disabled")
 
@@ -1842,10 +2424,20 @@ class App:
             pass
 
     def _tm_display(self, v):
-        """把配置值（LayerRef dict 或旧 name 字符串）转成 GUI 下拉显示 label（未加载 PSD 时原样返回）。"""
+        """把配置值（LayerRef dict 或旧 name 字符串）转成 GUI 下拉显示 label。
+
+        规格 6.5B 第 10 节：任何情况下 UI 不显示 dict / JSON / layer_id / index_path。
+        """
         if not v:
             return "（不替换）"
+        # 防御：历史配置可能直接存了 serialize_ref dict / dict 字符串
+        if isinstance(v, dict) or (isinstance(v, str) and v.startswith("{")):
+            label = layer_display_label(v, self.layer_labels if self.layer_index else None)
+            if label and label != "（不替换）":
+                return label
+            return "（不替换）"
         if self.layer_index is None:
+            # 未加载 PSD：原样字符串（已排除 dict 形态）
             return v
         ref = ref_from_config(v)
         if ref is None:
@@ -1859,7 +2451,8 @@ class App:
 
 
 def main():
-    root = tk.Tk()
+    # Stage 6.5B：ttkbootstrap Window（litera 主题在 APP_THEME 定义，主题数据随 PyInstaller 打包）
+    root = tb.Window(themename=APP_THEME)
     try:
         root.tk.call("encoding", "system", "utf-8")
     except Exception:

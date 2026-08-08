@@ -1,5 +1,7 @@
 pywin32>=300
 openpyxl>=3.0
+# Stage 6.5：现代 GUI 主题（经典版主题 flatly；2.x 重构版无 flatly，锁定 1.9.0）
+ttkbootstrap==1.9.0
 
 # 开发 / 测试依赖
 pytest>=7.0

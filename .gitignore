@@ -19,3 +19,23 @@ dist/
 # 系统
 .DS_Store
 Thumbs.db
+
+# Stage 6.5 临时验收产物（不提交）
+_s6acc_out/
+_s6acc_archived_*/
+_smoke*.py
+_shot*.py
+_s65_*.py
+_s65b_*
+_s65_*.spec
+s65_*.spec
+*.s65b_bak
+_acceptance_v110.py
+_acceptance_v110.log
+_acc_out/
+_ct/
+qifang_cover_maker_v110.py.bak
+psd_cover_batch.spec
+test_console.spec
+Stage6_*.html
+Stage65_*.html
