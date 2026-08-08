@@ -39,6 +39,13 @@ from core.photoshop import PhotoshopSession, com_retry
 from core.layer_index import (
     collect_layer_index, resolve_layer, ref_from_config, LayerRef,
 )
+# Stage 3：Logo 模型与映射（运行时确定性，不再 name 猜测）
+from core.logo_mapping import (
+    LogoMapping, LogoValidationError, LogoVisibilityError,
+    resolve_effective_logo_layers, match_store_logo, validate_logo_mapping,
+    prepare_logo_visibility, verify_logo_visibility, suggest_brand_logos,
+    EXACT, AUTO,
+)
 
 # ============================================================
 # PSD 图层名映射（按你的模板修改这里）
@@ -128,7 +135,6 @@ def inspect(psd_path, xlsx_path):
             doc = ps.open_document(psd_path)
             print(f"文档尺寸: {int(doc.Width)} x {int(doc.Height)}")
             print("\n图层树:")
-            registry = {}
 
             def walk(layers, depth=0):
                 for layer in layers:
@@ -158,26 +164,25 @@ def inspect(psd_path, xlsx_path):
                 for r in list(wb.active.iter_rows(values_only=True))[1:]:
                     if r and r[STORE_COL] is not None:
                         stores.add(str(r[STORE_COL]).strip())
-            brand_logos = [l.Name for l in doc.Layers
-                           if "logo" in l.Name.lower()
-                           and l.Name.strip() not in stores
-                           and "__group__:" + l.Name not in registry]
-            brand_set = set(brand_logos)
+            # Stage 3：inspect 也走 match_store_logo / suggest_brand_logos（首推逻辑），
+            # 不再用 name heuristic 直接判角色
+            index = collect_layer_index(doc)
+            leaf_refs = [r for r in index.layers if not r.is_group]
             store_map = {}
-            for l in doc.Layers:
-                if "__group__:" + l.Name in registry or l.Name in brand_set:
-                    continue
-                for s in stores:
-                    if core_util.fuzzy_contains(l.Name, s):
-                        store_map.setdefault(s, []).append(l.Name)
-                        break
-            print("\n匹配到的门店 Logo 图层（与 Excel 门店名「模糊包含」匹配）:")
+            for s in sorted(stores):
+                mr = match_store_logo(s, leaf_refs)
+                if mr.status in (EXACT, AUTO) and mr.best is not None:
+                    store_map[s] = mr.best.display_path
+                else:
+                    store_map[s] = f"（{mr.status}）"
+            brand_logos = [r.display_path for r in suggest_brand_logos(leaf_refs, {})]
+            print("\n匹配到的门店 Logo 图层（match_store_logo 评分匹配）:")
             if store_map:
                 for s in sorted(store_map):
                     print(f"  {s!r:12s} -> {store_map[s]}")
             else:
                 print("  (无，请检查门店名是否与图层名存在包含关系)")
-            print("\n品牌 Logo 图层（名字含 logo，每张封面都显示）:")
+            print("\n品牌 Logo 图层建议（名字含 logo 且未被门店使用，仅建议）:")
             print("  " + (", ".join(brand_logos) if brand_logos else "(无)"))
             # with 退出：Session 只关闭自己打开的 doc
 
@@ -197,43 +202,49 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
             rows = list(wb.active.iter_rows(values_only=True))
             data = rows[1:]
             stores = set(str(r[STORE_COL]).strip() for r in data if r and r[STORE_COL])
-            # 品牌 Logo：名字含 "logo"（且不正好等于门店名）的图层 —— 每张封面都显示，
-            # 例如「七方logo」「七方logo 拷贝」。可用 --brand-logo 显式指定覆盖自动识别。
-            auto_brand = [r for r in index.layers
-                          if "logo" in r.name.lower()
-                          and r.name.strip() not in stores
-                          and not r.is_group]
-            if brand_logos:
-                brand_logos = [r for r in index.layers
-                               if r.name in brand_logos and not r.is_group]
-            else:
-                brand_logos = auto_brand
-            brand_ids = {r.id for r in brand_logos}
 
-            # 门店 Logo：与 Excel 门店名「模糊包含」匹配（互含即可，不要求完全一致）。
-            # 例如 Excel 的「康乐」可匹配 PSD 的「康乐电器」，「九兴」可匹配「九兴电器」。
-            # 用 LayerRef 保存：每个门店 -> 匹配到的 PSD 图层 ref 列表
-            store_map = {}      # Excel 门店名 -> 匹配到的 LayerRef 列表
-            store_logos = []    # 去重后的所有门店 Logo LayerRef
-            seen_logo_ids = set()
-            for r in index.layers:
-                if r.is_group:
-                    continue
-                if r.id in brand_ids:
-                    continue
-                for s in stores:
-                    if core_util.fuzzy_contains(r.name, s):
-                        store_map.setdefault(s, []).append(r)
-                        if r.id not in seen_logo_ids:
-                            seen_logo_ids.add(r.id)
-                            store_logos.append(r)
-                        break
-            print(f"检测到门店 Logo 图层 {len(store_logos)} 个: "
-                  f"{[r.display_path for r in store_logos]}")
-            for s in sorted(store_map):
-                print(f"    门店 {s!r:12s} -> {[r.display_path for r in store_map[s]]}")
-            print(f"品牌 Logo 图层（始终显示）{len(brand_logos)} 个: "
-                  f"{[r.display_path for r in brand_logos]}")
+            # Stage 3：Logo 运行时数据 = LogoMapping（store_logo_map / brand_logo_refs）。
+            # 名称启发式只用于「首次自动推荐」（match_store_logo / suggest_brand_logos），
+            # 运行时不再 fuzzy / name guessing。
+            # 1) 门店映射：每个门店 -> match_store_logo 唯一高分（AMBIGUOUS/NO_MATCH -> None）
+            leaf_refs = [r for r in index.layers if not r.is_group]
+            store_logo_map = {}
+            for s in sorted(stores):
+                mr = match_store_logo(s, leaf_refs)
+                if mr.status in (EXACT, AUTO) and mr.best is not None:
+                    store_logo_map[s] = mr.best
+                else:
+                    store_logo_map[s] = None   # 歧义/无匹配：不自动选，运行时该门店报错
+            # 2) 品牌 Logo：显式 --brand-logo 优先；否则 suggest_brand_logos（仅推荐）
+            if brand_logos:
+                brand_refs = []
+                for nm in brand_logos:
+                    m = index.find_matching(nm)
+                    if len(m) == 1 and not m[0].is_group:
+                        brand_refs.append(m[0])
+                    elif len(m) > 1:
+                        print(f"  [警告] 品牌 Logo {nm!r} 同名多个，不自动选")
+            else:
+                brand_refs = suggest_brand_logos(leaf_refs, store_logo_map)
+            logo_map = LogoMapping(store_logo_map=store_logo_map,
+                                   brand_logo_refs=brand_refs,
+                                   logo_selection_refs=[r for r in leaf_refs])
+
+            # 运行前校验
+            try:
+                eff = resolve_effective_logo_layers(index, logo_map.logo_selection_refs)
+                validate_logo_mapping(logo_map, effective_leaf_refs=eff,
+                                      allow_duplicate_store_targets=True)
+            except LogoValidationError as e:
+                print(f"[Logo配置错误] {e}")
+                return
+            print(f"门店 Logo 映射（{sum(1 for v in store_logo_map.values() if v)} 个已匹配，"
+                  f"{sum(1 for v in store_logo_map.values() if v is None)} 个未映射）:")
+            for s in sorted(store_logo_map):
+                v = store_logo_map[s]
+                print(f"    门店 {s!r:12s} -> {v.display_path if v else '（未映射）'}")
+            print(f"品牌 Logo 图层（始终显示）{len(brand_refs)} 个: "
+                  f"{[r.display_path for r in brand_refs]}")
 
             # 文字层：Stage 2 按 LayerRef 精确定位（旧 name 常量 -> rebind 到唯一 ref；
             # 若同名歧义则回退 name 并在运行时按「精确 index_path」处理）
@@ -268,22 +279,37 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
                 set_text_ref(index, doc, text_refs.get("电话"), phone, label=PHONE_LAYER)
                 set_text_ref(index, doc, text_refs.get("销售顾问"), title, label=TITLE_LAYER)
 
-                target_refs = store_map.get(store, [])
-                target_ids = {t.id for t in target_refs}
-                for rr in store_logos:
+                # Stage 3：Logo 可见性 = 纯计划（prepare_logo_visibility）→ 逐项写 Visible。
+                # 无映射门店直接报错（不静默保留模板原 Logo）；effective 中未被使用的候选
+                # 叶子也隐藏（绝不保留模板原状态）。
+                try:
+                    plan = prepare_logo_visibility(store, logo_map, require_store_mapping=True,
+                                                   effective_leaf_refs=eff)
+                except LogoVisibilityError as e:
+                    print(f"  [Logo错误] {e}")
+                    return
+                applied = {}
+                for rr, visible in plan:
                     try:
                         layer = resolve_layer(doc, rr)
-                        layer.Visible = (rr.id in target_ids)
+                        layer.Visible = visible
+                        applied[rr.id] = visible
                     except Exception as e:
-                        print(f"  [警告] 定位门店 Logo {rr.display_path!r} 失败: {e}")
-                for rr in brand_logos:
-                    try:
-                        layer = resolve_layer(doc, rr)
-                        layer.Visible = True
-                    except Exception as e:
-                        print(f"  [警告] 定位品牌 Logo {rr.display_path!r} 失败: {e}")
-                shown = [t.display_path for t in target_refs] if target_refs else "（无匹配，门店 Logo 全部隐藏）"
-                print(f"  门店 Logo: 显示 {store!r} -> {shown}；品牌 Logo: 全部显示")
+                        print(f"  [警告] 定位 Logo {rr.display_path!r} 失败: {e}")
+                # 写后 read-back 校验
+                try:
+                    readback = {}
+                    for rr, _v in plan:
+                        try:
+                            readback[rr.id] = bool(resolve_layer(doc, rr).Visible)
+                        except Exception:
+                            readback[rr.id] = applied.get(rr.id)
+                    verify_logo_visibility(readback, plan)
+                except LogoVisibilityError as e:
+                    print(f"  [Logo校验失败] {e}")
+                    return
+                shown = [r.display_path for r, v in plan if v]
+                print(f"  门店 Logo: {store!r} -> {shown}")
 
                 fname = f"{idx + 1:03d}_{sanitize(store)}_{sanitize(name)}.png"
                 out_path = os.path.join(out_dir, fname)

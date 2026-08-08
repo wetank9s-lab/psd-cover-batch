@@ -32,6 +32,14 @@ from core.layer_index import (
     rebind_layer_reference, ref_from_config, serialize_ref,
     VALID, MIGRATED, AMBIGUOUS, MISSING,
 )
+# Stage 3：Logo 模型与映射（selection -> effective -> store/brand -> visibility plan）
+from core.logo_mapping import (
+    LogoMapping, LogoRole, LogoMatchResult, LogoValidationError, LogoVisibilityError,
+    resolve_effective_logo_layers, match_store_logo, validate_logo_mapping,
+    prepare_logo_visibility, verify_logo_visibility, migrate_old_config,
+    suggest_brand_logos, recommend_logo_selection,
+    EXACT, AUTO, AMBIGUOUS as LM_AMBIGUOUS, NO_MATCH,
+)
 
 # ---------------- Photoshop 资源管理 ----------------
 # Stage 1 起由 core.photoshop.PhotoshopSession 统一管理：
@@ -250,9 +258,141 @@ def brand_logos_for(logo_layers, store_logo_map):
     return out
 
 
-def _fuzzy_contains(a, b):
-    """门店名/图层名互含匹配（归一化后互相包含）。由 core.util.fuzzy_contains 提供。"""
-    return core_util.fuzzy_contains(a, b)
+# ----------------------------------------------------------------------------
+# Stage 3：Logo 运行时辅助（替代 brand_logos_for 的 name 猜测）
+# ----------------------------------------------------------------------------
+def _build_logo_mapping(cfg, index):
+    """从配置构造 LogoMapping（运行时唯一可信来源）。
+
+    读取新字段 logo_selection / brand_logo_layers（LayerRef dict 列表）；
+    兼容旧字段 logo_layers / store_logo_map（str 或 LayerRef dict）。
+
+    返回 LogoMapping：
+      - store_logo_map 的 value 全部转成叶子 LayerRef（旧 name 通过 LayerIndex rebind；
+        歧义/缺失 -> None，绝不在运行时猜）；
+      - brand_logo_refs 全部为叶子 LayerRef；
+      - logo_selection_refs 保留用户勾选（可能含组，仅供保存/展开）。
+    """
+    index = index if index is not None else _empty_index()
+    store_map = {}
+
+    # 1) 门店映射：优先新格式（dict store -> LayerRef dict/str），兼容旧
+    raw_store = cfg.get("store_logo_map") or {}
+    for s, v in raw_store.items():
+        if v in (None, "", "（无）"):
+            store_map[s] = None
+            continue
+        ref = ref_from_config(v) if not isinstance(v, LayerRef) else v
+        if ref is None:
+            store_map[s] = None
+            continue
+        # 迁移到当前 index：唯一命中用；歧义/缺失 -> None（不自动选）
+        cand = _rebind_leaf(index, ref)
+        store_map[s] = cand
+
+    # 2) 品牌 Logo：优先新字段 brand_logo_layers；兼容旧：从 logo_layers 中
+    #    名字含 logo 且未被门店使用的叶子（仅首载建议，运行时不再调用）
+    brand = []
+    raw_brand = cfg.get("brand_logo_layers")
+    if raw_brand:
+        for v in raw_brand:
+            ref = ref_from_config(v) if not isinstance(v, LayerRef) else v
+            if ref is None:
+                continue
+            cand = _rebind_leaf(index, ref)
+            if cand is not None:
+                brand.append(cand)
+    else:
+        # 旧配置兜底：从 logo_layers 中按 name 含 logo 且未被门店使用
+        mapped_ids = {r.id for r in store_map.values() if r is not None}
+        for v in (cfg.get("logo_layers") or []):
+            ref = ref_from_config(v) if not isinstance(v, LayerRef) else v
+            if ref is None:
+                continue
+            if "logo" in ref.name.lower() and ref.id not in mapped_ids:
+                cand = _rebind_leaf(index, ref)
+                if cand is not None:
+                    brand.append(cand)
+
+    # 3) selection：优先新字段 logo_selection；兼容旧 logo_layers
+    selected = []
+    raw_sel = cfg.get("logo_selection")
+    if raw_sel is None:
+        raw_sel = cfg.get("logo_layers") or []
+    for v in raw_sel:
+        ref = ref_from_config(v) if not isinstance(v, LayerRef) else v
+        if ref is None:
+            continue
+        cand = index.get(ref.id) if ref.id and index.get(ref.id) else _rebase_any(index, ref)
+        if cand is not None and cand.id not in {x.id for x in selected}:
+            selected.append(cand)
+
+    return LogoMapping(store_logo_map=store_map, brand_logo_refs=brand,
+                       logo_selection_refs=selected)
+
+
+def _empty_index():
+    from core.layer_index import LayerIndex
+    return LayerIndex([])
+
+
+def _rebind_leaf(index, ref):
+    """把 ref 绑定到当前 index 的叶子；歧义/缺失/是组 -> None（绝不自动选）。"""
+    if ref is None:
+        return None
+    if ref.id and index.get(ref.id):
+        cand = index.get(ref.id)
+        if cand.is_group:
+            return None
+        return cand
+    # id 失效 / 纯 name：按 name 唯一命中
+    matches = index.find_matching(ref.name)
+    if len(matches) == 1 and not matches[0].is_group:
+        return matches[0]
+    return None
+
+
+def _rebase_any(index, ref):
+    """selection 迁移允许组（旧配置 logo_layers 可能是组名）。"""
+    if ref is None:
+        return None
+    if ref.id and index.get(ref.id):
+        return index.get(ref.id)
+    matches = index.find_matching(ref.name)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _validate_runtime_logo(logo_map, index, log_cb):
+    """运行前校验 Logo 配置；返回错误消息字符串（无错误返回 None）。
+
+    校验通过后把 effective leaves 缓存在 logo_map 上（运行时 prepare 需要它隐藏
+    「候选但未被当前门店使用」的叶子）。
+    """
+    try:
+        effective = resolve_effective_logo_layers(index, logo_map.logo_selection_refs)
+        validate_logo_mapping(logo_map, effective_leaf_refs=effective,
+                              allow_duplicate_store_targets=True)
+        logo_map._effective_leaf_refs = effective
+        return None
+    except LogoValidationError as e:
+        return f"Logo 配置校验失败：{e}"
+
+
+def _verify_applied_visibility(doc, index, plan, applied, log_cb):
+    """写 Visible 后 read-back 校验：不一致抛 LogoVisibilityError（不静默成功）。"""
+    readback = {}
+    for ref, _expected in plan:
+        try:
+            layer = resolve_layer(doc, ref)
+            readback[ref.id] = bool(layer.Visible)
+        except Exception:
+            readback[ref.id] = applied.get(ref.id)   # 无法 resolve：以 applied 兜底（日志提示）
+    verify_logo_visibility(readback, plan)
+
+
+
 
 
 def _enable_parents(container):
@@ -428,8 +568,13 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
 
             out_dir = cfg["out_dir"]
             os.makedirs(out_dir, exist_ok=True)
-            logo_layers = cfg["logo_layers"]
-            store_logo_map = cfg["store_logo_map"]
+            # Stage 3：Logo 运行时数据 = LogoMapping（store_logo_map / brand_logo_refs / logo_selection_refs）。
+            # 不再在运行时用 name heuristic 判断品牌/门店（brand_logos_for 已废弃）。
+            logo_map = _build_logo_mapping(cfg, index)
+            logo_validation = _validate_runtime_logo(logo_map, index, log_cb)
+            if logo_validation:
+                log_cb(logo_validation)
+                return
             fmt = cfg["fmt"]
             also_png = cfg["also_png"]
             col_role = cfg["col_role"]
@@ -470,19 +615,27 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
                     if role_ref and role is not None:
                         set_text_by_ref(d, index, role_ref, role, log_cb, label="销售顾问")
 
-                    # Logo 图层切换：只显示本门店对应的 Logo，隐藏其余候选 Logo；
-                    # 品牌 Logo（含 'logo' 且非门店 Logo）每张封面强制显示。
-                    # Stage 2：identity 已改为 LayerRef（layer_id），业务规则（品牌/门店）不变。
-                    mapped = store_logo_map.get(store, "")
-                    brand = brand_logos_for(cfg["logo_layers"], cfg["store_logo_map"])
-                    brand_keys = {_ref_key(x) for x in brand}
-                    mapped_key = _ref_key(mapped) if mapped else None
-                    for ln in cfg["logo_layers"]:
-                        if _ref_key(ln) in brand_keys:
-                            set_visible_by_ref(d, index, ln, True, log_cb, label="品牌Logo")
-                        else:
-                            set_visible_by_ref(d, index, ln, (_ref_key(ln) == mapped_key),
-                                               log_cb, label="门店Logo")
+                    # Stage 3：Logo 可见性 = 纯计划（prepare_logo_visibility）→ 逐项写 Visible。
+                    # 运行时不再 fuzzy / name guessing；无映射门店直接报错（不静默保留模板原 Logo）。
+                    try:
+                        plan = prepare_logo_visibility(
+                            store, logo_map, require_store_mapping=True,
+                            effective_leaf_refs=getattr(logo_map, "_effective_leaf_refs", None))
+                    except LogoVisibilityError as e:
+                        log_cb(f"  [Logo错误] {e}")
+                        raise
+                    applied = {}
+                    for ref, visible in plan:
+                        ok, status = set_visible_by_ref(d, index, ref, visible,
+                                                         log_cb, label=ref.display_path)
+                        if ok:
+                            applied[ref.id] = visible
+                    # 写后 read-back 校验：不一致不能静默成功
+                    try:
+                        _verify_applied_visibility(d, index, plan, applied, log_cb)
+                    except LogoVisibilityError as e:
+                        log_cb(f"  [Logo校验失败] {e}")
+                        raise
 
                     safe_store = core_util.sanitize_filename(store)
                     safe_name = core_util.sanitize_filename(name)
@@ -547,6 +700,11 @@ class App:
         self.layer_labels = {}           # layer_id -> 展示 label（同名时含 [id=...] 后缀，保证肉眼可区分）
         self.text_label_to_ref = {}      # label -> LayerRef（文字层）
         self.logo_label_to_ref = {}      # label -> LayerRef（当前有效 Logo 叶子）
+        # Stage 3 补充：品牌 Logo 人工指定（selected 叶子 -> BRAND）
+        #   brand_checks: label -> BooleanVar（勾选 = 该 leaf 是固定品牌 Logo）
+        #   brand_widgets: label -> Checkbutton（重建时记录，供冲突回滚刷新）
+        self.brand_checks = {}
+        self.brand_widgets = {}
         self.excel_stores = []
         self.excel_headers = []
         self.running = False
@@ -697,6 +855,24 @@ class App:
         # 右：门店 -> Logo 映射
         rf = ttk.LabelFrame(right, text="门店 → Logo 图层 映射", padding=6)
         rf.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # 品牌 Logo 人工指定（Stage 3 补充）：
+        #   「固定品牌 Logo」= 每张封面强制显示的叶子（如 七方logo / 圣大）。
+        #   独立于门店映射：勾选 selected 只是候选集合，不等于 brand；
+        #   这里人工勾选某个 leaf 才真正把它写入 brand_logo_refs。
+        bf2 = ttk.LabelFrame(rf, text="固定品牌 Logo（每张封面都显示；勾选 = 人工指定 BRAND）",
+                             padding=4)
+        bf2.pack(fill="x", padx=4, pady=(0, 4))
+        self.brand_canvas = tk.Canvas(bf2, height=90)
+        self.brand_scroll = ttk.Scrollbar(bf2, orient="vertical", command=self.brand_canvas.yview)
+        self.brand_inner = ttk.Frame(self.brand_canvas)
+        self.brand_inner.bind("<Configure>", lambda e: self.brand_canvas.configure(
+            scrollregion=self.brand_canvas.bbox("all")))
+        self.brand_canvas.create_window((0, 0), window=self.brand_inner, anchor="nw")
+        self.brand_canvas.configure(yscrollcommand=self.brand_scroll.set)
+        self.brand_canvas.pack(side="left", fill="both", expand=True)
+        self.brand_scroll.pack(side="right", fill="y")
+
         self.map_canvas = tk.Canvas(rf)
         self.map_scroll = ttk.Scrollbar(rf, orient="vertical", command=self.map_canvas.yview)
         self.map_inner = ttk.Frame(self.map_canvas)
@@ -824,9 +1000,14 @@ class App:
             messagebox.showerror("PSD 错误", f"无法解析 PSD（请确认 Photoshop 已安装并可启动）：\n{e}")
             return
 
-        # 默认勾选 Logo 候选：名称含 "logo"，或位于名为 logo 的组内，
-        # 或图层名与 Excel 门店名一致（平铺式门店 Logo），且本身不是组
+        # ---- Logo 勾选与映射（Stage 3 数据流）----
+        # 概念分离：
+        #   勾选 = selected Logo refs（可含组，仅 GUI selection）
+        #   展开 = resolve_effective_logo_layers(selected) -> 叶子候选
+        #   映射 = store_logo_map（叶子 LayerRef）+ brand_logo_refs（叶子 LayerRef）
+        # 名称启发式只用于「首次自动推荐」；运行时绝不再次 name 猜测。
         def is_logo_candidate(ref):
+            # 仅用于首次加载的推荐勾选（不是运行时规则）
             if ref.is_group:
                 return False
             if "logo" in ref.name.lower():
@@ -836,15 +1017,21 @@ class App:
                 return True
             return ref.name in stores
 
-        # 恢复上次保存的 Logo 勾选状态（含勾选的组），否则按名称启发式默认
-        # Stage 2：logo_layers 可能是 LayerRef dict 或旧 name 字符串；
-        # dict 不可 hash，不能直接 set()，统一转成 name/id 判断。
-        saved_items = self.cfg.get("logo_layers", [])
+        # 首次加载推荐勾选（修复 P1-02）：
+        #   recommend_logo_selection = logo heuristic 勾选 ∪ 与任一门店唯一命中叶子
+        #   —— 保证「普通素材 > 康乐电器」这类无 logo 关键字的门店目标叶子进入
+        #      effective，match_store_logo 才能看到它（AUTO 推荐康乐电器）。
+        #   注意：只在「无保存配置」时推荐；有保存的 logo_selection 一律以保存值为准。
+        saved_items_raw = self.cfg.get("logo_selection")
+        if saved_items_raw is None:
+            saved_items_raw = self.cfg.get("logo_layers", [])
+        has_saved_selection = bool(saved_items_raw)
+
+        # 恢复上次保存的勾选状态（优先新字段 logo_selection，兼容旧 logo_layers）
+        saved_items = saved_items_raw
         saved_names = {x for x in saved_items if isinstance(x, str)}
         saved_logo_ids = {ref_from_config(x).id for x in saved_items
                           if ref_from_config(x) is not None and ref_from_config(x).id}
-        saved_logo = saved_names
-        children_map = self._build_children_map()
 
         def inherited_checked(ref):
             if ref.id in saved_logo_ids or ref.name in saved_names:
@@ -861,15 +1048,27 @@ class App:
             return False
 
         self.logo_checks = {}
+        # 首次推荐（无保存配置时）：recommend_logo_selection（含门店匹配目标）
+        recommend = []
+        if not has_saved_selection:
+            recommend = recommend_logo_selection(
+                self.layer_index.layers, stores, is_logo_heuristic=is_logo_candidate)
         for ref in self.layer_index.layers:
             label = self.layer_labels[ref.id]
-            checked = is_logo_candidate(ref) or inherited_checked(ref)
+            if has_saved_selection:
+                checked = inherited_checked(ref)
+            else:
+                checked = ref.id in {r.id for r in recommend} or inherited_checked(ref)
             self.logo_checks[label] = tk.BooleanVar(value=checked)
 
-        # 自动匹配 门店->Logo（图层名包含门店名则自动选；Stage 2：同名歧义不自动选第一个）
+        # 自动匹配 门店->Logo：候选 = 当前勾选展开后的全部叶子（含组展开）。
+        # 不再用 is_logo_candidate 预过滤（修复「康乐 -> 康乐电器」P0）：
+        #   先展开 effective leaves，再 match_store_logo 评分；
+        #   AMBIGUOUS / NO_MATCH -> 保持（无），绝不自动选第一个。
         prev_map = self.cfg.get("store_logo_map", {})
         self.map_combos = {}
-        logo_candidate_refs = [r for r in self.layer_index.layers if is_logo_candidate(r)]
+        selected_refs = self._selected_logo_refs()
+        effective_leaves = resolve_effective_logo_layers(self.layer_index, selected_refs)
         for s in stores:
             default_label = "（无）"
             if s in prev_map:
@@ -886,12 +1085,12 @@ class App:
                         elif len(m) > 1:
                             default_label = "（无）"   # ambiguous：不自动选
             else:
-                hits = [r for r in logo_candidate_refs
-                        if core_util.fuzzy_contains(r.name, s)]
-                if len(hits) == 1:
-                    default_label = self.layer_labels[hits[0].id]
-                elif len(hits) > 1:
-                    default_label = "（无）"   # 同名歧义：不自动选
+                # 首次自动推荐：只用当前 effective 叶子候选（不预过滤 name 含 logo）
+                mr = match_store_logo(s, effective_leaves)
+                if mr.status in (EXACT, AUTO) and mr.best is not None:
+                    default_label = self.layer_labels[mr.best.id]
+                else:
+                    default_label = "（无）"   # AMBIGUOUS / NO_MATCH：不自动选
             self.map_combos[s] = tk.StringVar(value=default_label)
 
         # 文字图层映射：Stage 2 候选显示 display_path（同名肉眼可区分）；
@@ -924,6 +1123,40 @@ class App:
         self.tm_name_var.set(auto_text("姓名"))
         self.tm_phone_var.set(auto_text("电话"))
         self.tm_role_var.set(auto_text("销售顾问"))
+
+        # ---- 品牌 Logo 初始勾选（Stage 3 补充）----
+        # 优先级：
+        #   1) 保存配置 brand_logo_layers（重启恢复，人工指定为准）；
+        #   2) 否则 suggest_brand_logos 建议（仅默认建议，非唯一入口）。
+        # 运行时只读保存后的 brand_logo_refs，此处只是预填 GUI 勾选。
+        saved_brand = self.cfg.get("brand_logo_layers")
+        self.brand_checks = {}
+        if saved_brand:
+            saved_brand_ids = set()
+            for v in saved_brand:
+                ref = ref_from_config(v)
+                if ref is not None and ref.id and ref.id in self._ref_by_id:
+                    saved_brand_ids.add(ref.id)
+            for label in self._effective_logo_layers():
+                ref = self._label_to_ref(label)
+                checked = ref is not None and ref.id in saved_brand_ids
+                self.brand_checks[label] = tk.BooleanVar(value=checked)
+        else:
+            # 首次：suggest_brand_logos 建议（name 含 logo 且未映射）仅默认勾选
+            # 构造 store -> ref（当前下拉已选值，可能为「（无）」）
+            store_map_now = {}
+            for s, var in self.map_combos.items():
+                v = var.get()
+                store_map_now[s] = self._label_to_ref(v) if v != "（无）" else None
+            try:
+                suggest = suggest_brand_logos(effective_leaves, store_map_now)
+            except Exception:
+                suggest = []
+            suggest_ids = {r.id for r in suggest}
+            for label in self._effective_logo_layers():
+                ref = self._label_to_ref(label)
+                self.brand_checks[label] = tk.BooleanVar(
+                    value=ref is not None and ref.id in suggest_ids)
 
         self._rebuild_logo_lists()
         self._log_gui(f"解析完成：PSD 共 {len(self.layer_index)} 个图层，Excel 共 {len(stores)} 个门店。")
@@ -970,28 +1203,31 @@ class App:
         return children
 
     def _effective_logo_layers(self):
-        """返回当前应作为候选 Logo 的『叶子图层 label 列表』（含被勾选组的子图层）。"""
-        children = self._build_children_map()
+        """返回当前应作为候选 Logo 的『叶子图层 label 列表』（含被勾选组的子图层）。
+
+        Stage 3：走 core.logo_mapping.resolve_effective_logo_layers（纯函数、按 id 去重、
+        组递归展开、组本身不进结果）。
+        """
+        selected = self._selected_logo_refs()
+        eff = resolve_effective_logo_layers(self.layer_index, selected)
         result = []
+        for r in eff:
+            label = self.layer_labels.get(r.id)
+            if label and label not in result:
+                result.append(label)
+        return result
 
-        def collect(rid):
-            ref = self._ref_by_id.get(rid)
-            if ref is None:
-                return
-            if ref.is_group:
-                for ch in children.get(rid, []):
-                    collect(ch)
-            else:
-                label = self.layer_labels.get(rid)
-                if label and label not in result:
-                    result.append(label)
-
+    def _selected_logo_refs(self):
+        """当前 GUI 勾选的 Logo 图层（含组）-> LayerRef 列表（Stage 3 selection）。"""
+        out = []
+        seen = set()
         for label, var in self.logo_checks.items():
             if var.get():
                 ref = self._label_to_ref(label)
-                if ref is not None:
-                    collect(ref.id)
-        return result
+                if ref is not None and ref.id not in seen:
+                    seen.add(ref.id)
+                    out.append(ref)
+        return out
 
     def _rebuild_logo_lists(self):
         # 清空
@@ -999,7 +1235,10 @@ class App:
             w.destroy()
         for w in self.map_inner.winfo_children():
             w.destroy()
+        for w in self.brand_inner.winfo_children():
+            w.destroy()
         self.map_combo_widgets = {}
+        self.brand_widgets = {}
 
         ttk.Label(self.logo_inner, text="☑ 图层（显示完整路径）", font=("Microsoft YaHei", 9, "bold")).grid(
             row=0, column=0, sticky="w", padx=4, pady=2)
@@ -1009,6 +1248,30 @@ class App:
             # 勾选状态变化时，同步刷新右侧门店→Logo 下拉列表
             self.logo_checks[label].trace_add(
                 "write", lambda *a: self._on_logo_checks_changed())
+
+        # ---- 品牌 Logo 人工指定（Stage 3 补充）----
+        # 可选项 = 当前 effective 叶子（勾选的候选集合）；勾选 = 该 leaf 是固定品牌。
+        # 语义：selected 只是候选集合，不等于 brand；这里人工勾选才真正写入 brand。
+        eff_labels = self._effective_logo_layers()
+        if not eff_labels:
+            ttk.Label(self.brand_inner, text="（先勾选左侧 Logo 图层后，这里可指定品牌）",
+                      foreground="#888").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        else:
+            ttk.Label(self.brand_inner, text="☑ 固定品牌 Logo（叶子）",
+                      font=("Microsoft YaHei", 9, "bold")).grid(
+                row=0, column=0, sticky="w", padx=4, pady=2)
+            for i, label in enumerate(eff_labels, start=1):
+                # 该 leaf 若已被某门店映射为 store target，标记（冲突提示用）
+                store_owner = self._store_owner_of_leaf(label)
+                suffix = f"（门店:{store_owner}）" if store_owner else ""
+                var = self.brand_checks.get(label, tk.BooleanVar(value=False))
+                var.set(var.get())   # 保持既有状态
+                cb = ttk.Checkbutton(
+                    self.brand_inner, text=label + suffix, variable=var,
+                    command=lambda lb=label: self._on_brand_toggle(lb))
+                cb.grid(row=i, column=0, sticky="w", padx=4, pady=1)
+                self.brand_widgets[label] = cb
+                self.brand_checks[label] = var
 
         # 映射表
         ttk.Label(self.map_inner, text="门店", font=("Microsoft YaHei", 9, "bold")).grid(
@@ -1023,17 +1286,67 @@ class App:
             cb.grid(row=i, column=1, sticky="w", padx=4, pady=1)
             self.map_combo_widgets[s] = cb
 
+    def _store_owner_of_leaf(self, label):
+        """返回把该 leaf 选为门店 Logo 的门店名（无则空）。冲突提示用。"""
+        ref = self._label_to_ref(label)
+        if ref is None:
+            return ""
+        for s, var in self.map_combos.items():
+            if var.get() == label:
+                return s
+            # 兼容：下拉值可能是 ref 序列化 label（含 id 后缀）
+            if var.get() and self._label_to_ref(var.get()) is not None \
+                    and self._label_to_ref(var.get()).id == ref.id:
+                return s
+        return ""
+
+    def _on_brand_toggle(self, label):
+        """品牌勾选变化：同 leaf 若已是 store target -> 冲突提示并回滚。
+
+        规则（用户要求）：
+          - 同一 LayerRef 不能同时是 store target 与 brand；
+          - 勾选时若发现已是某门店 store target，立即弹提示并恢复未勾选。
+        """
+        var = self.brand_checks.get(label)
+        if var is None:
+            return
+        if not var.get():
+            return   # 取消勾选：合法，直接放行
+        # 勾选动作：检查冲突
+        owner = self._store_owner_of_leaf(label)
+        if owner:
+            var.set(False)   # 回滚
+            messagebox.showwarning(
+                "品牌 Logo 冲突",
+                f"图层「{label}」已被门店「{owner}」选为门店 Logo，"
+                f"不能同时作为固定品牌 Logo。\n请先在右侧门店映射中把它改为其他图层。")
+            return
+        self._log_gui(f"品牌 Logo 已指定：{label}")
+
     def _on_logo_checks_changed(self):
-        """左侧勾选 Logo 图层变动时，实时同步右侧门店→Logo 下拉的可选项。"""
+        """左侧勾选 Logo 图层变动时，实时同步右侧门店→Logo 下拉的可选项。
+
+        Stage 3：若某个门店当前映射的叶子已被取消勾选（不再在 effective 集合内），
+        该映射自动重置为「（无）」并提示（绝不静默继续使用失效映射）。
+        品牌勾选同样联动：被取消勾选的叶子不再是候选（其 brand 标记一并清除并提示）。
+        """
         logo_opts = ["（无）"] + self._effective_logo_layers()
+        eff_ids = {self._label_to_ref(lb).id for lb in logo_opts[1:]}
         for s, var in self.map_combos.items():
             w = self.map_combo_widgets.get(s)
             if w is None:
                 continue
             cur = var.get()
             if cur not in logo_opts:
+                if cur != "（无）":
+                    self._log_gui(f"“{s}”的原 Logo 映射已不在当前选择范围，已清除。")
                 var.set("（无）")
             w["values"] = logo_opts
+        # 品牌：已勾选但不再在 effective 的叶子 -> 清除 brand 标记并提示
+        for label, var in list(self.brand_checks.items()):
+            if var.get() and label not in logo_opts[1:]:
+                var.set(False)
+                self._log_gui(f"品牌 Logo「{label}」已不在当前选择范围，已清除。")
 
     # ---------------- 运行 ----------------
     def _collect_cfg(self):
@@ -1053,6 +1366,17 @@ class App:
         for s, var in self.map_combos.items():
             val = var.get()
             store_logo_map[s] = "" if val == "（无）" else ref_to_cfg(val)
+        # Stage 3：品牌 Logo 明确保存（叶子 LayerRef）。
+        # 以「固定品牌 Logo」区块的人工勾选为准（brand_checks）——selected 只是候选，
+        # 人工勾选才真正写入 brand_logo_refs；首次加载的 suggest_brand_logos 建议
+        # 会在 _load 中预填这些勾选（仅默认建议，不是唯一入口）。
+        # 运行时只读取这里保存的 brand_logo_layers，不再每行 name 猜测。
+        brand_logo_layers = []
+        for label, var in self.brand_checks.items():
+            if var.get():
+                ref = self._label_to_ref(label)
+                if ref is not None:
+                    brand_logo_layers.append(serialize_ref(ref))
         def tm_val(var):
             v = var.get()
             if v == "（不替换）":
@@ -1073,8 +1397,14 @@ class App:
             "col_phone": col_of(self.col_phone_var.get()),
             "col_role": col_of(self.col_role_var.get()),
             "text_map": text_map,
-            "logo_layers": logo_layers,
+            # Stage 3 新字段（运行时唯一来源）
+            "logo_selection": [ref_to_cfg(label)
+                               for label in self.all_psd_layers_labels()
+                               if self.logo_checks.get(label, tk.BooleanVar()).get()],
             "store_logo_map": store_logo_map,
+            "brand_logo_layers": brand_logo_layers,
+            # 旧字段保留（兼容旧版读取）
+            "logo_layers": logo_layers,
             "fmt": self.fmt_var.get(),
             "also_png": self.also_png_var.get(),
         }
@@ -1173,16 +1503,21 @@ class App:
                     if role_ref and role is not None:
                         set_text_by_ref(d, index, role_ref, role, self._log_gui, label="销售顾问")
 
-                    mapped = cfg["store_logo_map"].get(store, "")
-                    brand = brand_logos_for(cfg["logo_layers"], cfg["store_logo_map"])
-                    brand_keys = {_ref_key(x) for x in brand}
-                    mapped_key = _ref_key(mapped) if mapped else None
-                    for ln in cfg["logo_layers"]:
-                        if _ref_key(ln) in brand_keys:
-                            set_visible_by_ref(d, index, ln, True, self._log_gui, label="品牌Logo")
-                        else:
-                            set_visible_by_ref(d, index, ln, (_ref_key(ln) == mapped_key),
-                                               self._log_gui, label="门店Logo")
+                    # Stage 3：Logo 可见性计划（同 run_batch）
+                    logo_map = _build_logo_mapping(cfg, index)
+                    logo_err = _validate_runtime_logo(logo_map, index, self._log_gui)
+                    if logo_err:
+                        raise LogoVisibilityError(logo_err)
+                    plan = prepare_logo_visibility(
+                        store, logo_map, require_store_mapping=True,
+                        effective_leaf_refs=getattr(logo_map, "_effective_leaf_refs", None))
+                    applied = {}
+                    for ref, visible in plan:
+                        ok, status = set_visible_by_ref(d, index, ref, visible,
+                                                        self._log_gui, label=ref.display_path)
+                        if ok:
+                            applied[ref.id] = visible
+                    _verify_applied_visibility(d, index, plan, applied, self._log_gui)
                     p = os.path.join(tmp, "preview.png")
                     export_doc(d, p, FMT_PNG)
                     self._log_gui(f"预览已生成：{p}")
