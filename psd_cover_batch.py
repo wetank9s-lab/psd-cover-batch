@@ -29,7 +29,6 @@ import sys
 import time
 import argparse
 import win32com.client
-import openpyxl
 
 # Stage 0：引入 core 纯函数（行为等价），供测试复用
 from core import util as core_util
@@ -45,6 +44,11 @@ from core.logo_mapping import (
     resolve_effective_logo_layers, match_store_logo, validate_logo_mapping,
     prepare_logo_visibility, verify_logo_visibility, suggest_brand_logos,
     EXACT, AUTO,
+)
+# Stage 4：统一 Excel 数据管线（CLI 也统一走 load_excel_dataset）
+from core.excel_data import (
+    ExcelRow, ExcelDataset, SkippedRow, ExcelDataError,
+    load_excel_dataset,
 )
 
 # ============================================================
@@ -157,13 +161,18 @@ def inspect(psd_path, xlsx_path):
 
             walk(doc.Layers)
 
-            # 库存门店名
+            # 库存门店名（Stage 4：统一入口 load_excel_dataset）
             stores = set()
             if xlsx_path and os.path.exists(xlsx_path):
-                wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-                for r in list(wb.active.iter_rows(values_only=True))[1:]:
-                    if r and r[STORE_COL] is not None:
-                        stores.add(str(r[STORE_COL]).strip())
+                try:
+                    ds = load_excel_dataset(
+                        xlsx_path,
+                        has_header=True,
+                        col_store=STORE_COL, col_name=NAME_COL, col_phone=PHONE_COL,
+                    )
+                    stores = set(ds.stores)
+                except ExcelDataError as e:
+                    print(f"[Excel 错误] {e}")
             # Stage 3：inspect 也走 match_store_logo / suggest_brand_logos（首推逻辑），
             # 不再用 name heuristic 直接判角色
             index = collect_layer_index(doc)
@@ -198,10 +207,21 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
             # Stage 2：用 LayerIndex 建立唯一图层身份（不再用 name 当 ID）
             index = collect_layer_index(doc)
 
-            wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-            rows = list(wb.active.iter_rows(values_only=True))
-            data = rows[1:]
-            stores = set(str(r[STORE_COL]).strip() for r in data if r and r[STORE_COL])
+            # Stage 4：统一入口 load_excel_dataset（CLI 固定表头 + 固定列，语义与旧版一致）
+            try:
+                ds = load_excel_dataset(
+                    xlsx_path,
+                    has_header=True,
+                    col_store=STORE_COL, col_name=NAME_COL, col_phone=PHONE_COL,
+                    col_role=TITLE_COL,
+                )
+            except ExcelDataError as e:
+                print(f"[Excel 错误] {e}")
+                return
+            data = ds.valid_rows
+            stores = set(ds.stores)
+            print(f"Excel 读取完成：{len(data)} 行有效数据，跳过 {len(ds.skipped_rows)} 行"
+                  f"（sheet：{ds.sheet_name}）。")
 
             # Stage 3：Logo 运行时数据 = LogoMapping（store_logo_map / brand_logo_refs）。
             # 名称启发式只用于「首次自动推荐」（match_store_logo / suggest_brand_logos），
@@ -262,17 +282,12 @@ def run(psd_path, xlsx_path, out_dir, row=None, brand_logos=None):
                 if idx < 0 or idx >= len(data):
                     print(f"[跳过] 行号越界: {idx + 1}")
                     continue
+                # Stage 4：r 已是 ExcelRow（load_excel_dataset 统一解析）
                 r = data[idx]
-                if not r or r[NAME_COL] is None:
-                    print(f"[跳过] 第 {idx + 1} 行数据不完整")
-                    continue
-                store = str(r[STORE_COL]).strip() if r[STORE_COL] is not None else ""
-                name = str(r[NAME_COL]).strip()
-                title = str(r[TITLE_COL]).strip() if r[TITLE_COL] is not None else ""
-                phone = r[PHONE_COL]
-                if isinstance(phone, float):
-                    phone = int(phone)
-                phone = str(phone).strip()
+                store = r.store
+                name = r.name
+                title = r.role or ""
+                phone = r.phone
 
                 print(f"\n[{idx + 1}/{len(data)}] 门店={store!r} 姓名={name!r} 电话={phone!r}")
                 set_text_ref(index, doc, text_refs.get("姓名"), name, label=NAME_LAYER)

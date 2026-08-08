@@ -20,7 +20,6 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 import win32com.client
 import pythoncom
-import openpyxl
 
 # Stage 0：引入 core 纯函数（不依赖 COM / Tk），保持行为一致，供测试与复用
 from core import util as core_util
@@ -39,6 +38,11 @@ from core.logo_mapping import (
     prepare_logo_visibility, verify_logo_visibility, migrate_old_config,
     suggest_brand_logos, recommend_logo_selection,
     EXACT, AUTO, AMBIGUOUS as LM_AMBIGUOUS, NO_MATCH,
+)
+# Stage 4：统一 Excel 数据管线（GUI 全部入口统一走 load_excel_dataset）
+from core.excel_data import (
+    ExcelRow, ExcelDataset, SkippedRow, ExcelDataError,
+    load_excel_dataset, index_to_excel_column, excel_column_to_index,
 )
 
 # ---------------- Photoshop 资源管理 ----------------
@@ -526,22 +530,22 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
     """
     # COM 初始化/反初始化由 PhotoshopSession 的 __enter__/__exit__ 统一负责
     try:
-        # ---- 读取 Excel ----
-        wb = openpyxl.load_workbook(cfg["xlsx_path"], data_only=True)
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        start = 1 if cfg["has_header"] else 0
-        data = []
-        skipped = 0
-        for r in rows[start:]:
-            store = r[cfg["col_store"]] if cfg["col_store"] < len(r) else None
-            name = r[cfg["col_name"]] if cfg["col_name"] < len(r) else None
-            phone = r[cfg["col_phone"]] if cfg["col_phone"] < len(r) else None
-            if name is None or phone is None or str(name).strip() == "":
-                skipped += 1
-                continue
-            data.append(r)
-        log_cb(f"Excel 读取完成：{len(data)} 行有效数据，跳过 {skipped} 行空行。")
+        # ---- 读取 Excel（Stage 4：统一入口 load_excel_dataset）----
+        try:
+            dataset = load_excel_dataset(
+                cfg["xlsx_path"],
+                has_header=cfg.get("has_header", True),
+                col_store=cfg["col_store"],
+                col_name=cfg["col_name"],
+                col_phone=cfg["col_phone"],
+                col_role=cfg["col_role"] if cfg.get("col_role", -1) >= 0 else None,
+            )
+        except ExcelDataError as e:
+            log_cb(f"Excel 错误：{e}")
+            return
+        data = dataset.valid_rows
+        log_cb(f"Excel 读取完成：{len(data)} 行有效数据，"
+               f"跳过 {len(dataset.skipped_rows)} 行（sheet：{dataset.sheet_name}）。")
         if not data:
             log_cb("没有可处理的数据，已停止。")
             return
@@ -578,9 +582,6 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
             fmt = cfg["fmt"]
             also_png = cfg["also_png"]
             col_role = cfg["col_role"]
-            col_name = cfg["col_name"]
-            col_phone = cfg["col_phone"]
-            col_store = cfg["col_store"]
 
             total = len(data)
             done = 0
@@ -589,14 +590,11 @@ def run_batch(cfg, progress_cb, log_cb, stop_flag):
                 if stop_flag.is_set():
                     log_cb("用户已停止。")
                     break
-                store = str(r[col_store]).strip() if r[col_store] is not None else ""
-                name = str(r[col_name]).strip()
-                phone_v = r[col_phone]
-                phone_s = str(int(phone_v)) if isinstance(phone_v, (int, float)) else str(phone_v).strip()
-                if col_role >= 0 and col_role < len(r) and r[col_role] is not None:
-                    role = str(r[col_role]).strip()
-                else:
-                    role = None
+                # Stage 4：r 已是 ExcelRow（load_excel_dataset 统一解析）
+                store = r.store
+                name = r.name
+                phone_s = r.phone
+                role = r.role if col_role >= 0 else None
 
                 d = None
                 try:
@@ -683,7 +681,7 @@ class App:
         self.config_path = self._find_config_path()
         self.cfg = {
             "psd_path": "", "xlsx_path": "", "out_dir": "",
-            "has_header": False,
+            "has_header": True,
             "col_store": 0, "col_name": 1, "col_phone": 3, "col_role": 2,
             "text_map": {"姓名": "", "电话": "", "销售顾问": ""},
             "logo_layers": [], "store_logo_map": {},
@@ -707,6 +705,8 @@ class App:
         self.brand_widgets = {}
         self.excel_stores = []
         self.excel_headers = []
+        # Stage 4：当前加载的 ExcelDataset（统一数据源；_load 后才有值）
+        self.excel_dataset = None
         self.running = False
         self.stop_flag = threading.Event()
         self.worker = None
@@ -762,32 +762,38 @@ class App:
         ttk.Entry(row, textvariable=self.out_var, width=55).grid(row=2, column=1, padx=4)
         ttk.Button(row, text="浏览...", command=self._pick_out).grid(row=2, column=2)
 
-        self.header_var = tk.BooleanVar(value=False)
+        # Stage 4：has_header 默认 True（已有 config 优先，见 _load_config）
+        self.header_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="Excel 首行为表头（数据从第2行开始）",
                         variable=self.header_var).grid(row=3, column=1, sticky="w", pady=3)
 
-        # 字段映射
+        # 字段映射（Stage 4：列下拉按实际工作表动态生成，这里只放默认 A..Z 兜底）
         mf = ttk.LabelFrame(parent, text="字段映射（选择 Excel 列）", padding=8)
         mf.pack(fill="x", padx=6, pady=6)
 
-        cols = [chr(ord("A") + i) for i in range(16)]  # A..P
+        cols = [index_to_excel_column(i) for i in range(26)]  # A..Z（加载后按实际列数刷新）
         self.col_store_var = tk.StringVar(value="A")
         self.col_name_var = tk.StringVar(value="B")
         self.col_phone_var = tk.StringVar(value="D")
         self.col_role_var = tk.StringVar(value="C")
+        self._column_labels = cols
 
         ttk.Label(mf, text="门店列（用于选 Logo）:").grid(row=0, column=0, sticky="e", pady=3)
-        ttk.Combobox(mf, textvariable=self.col_store_var, values=cols, width=6,
-                     state="readonly").grid(row=0, column=1, padx=4, sticky="w")
+        self.col_store_cb = ttk.Combobox(mf, textvariable=self.col_store_var, values=cols,
+                                         width=8, state="readonly")
+        self.col_store_cb.grid(row=0, column=1, padx=4, sticky="w")
         ttk.Label(mf, text="姓名列:").grid(row=0, column=2, sticky="e", pady=3)
-        ttk.Combobox(mf, textvariable=self.col_name_var, values=cols, width=6,
-                     state="readonly").grid(row=0, column=3, padx=4, sticky="w")
+        self.col_name_cb = ttk.Combobox(mf, textvariable=self.col_name_var, values=cols,
+                                        width=8, state="readonly")
+        self.col_name_cb.grid(row=0, column=3, padx=4, sticky="w")
         ttk.Label(mf, text="电话列:").grid(row=1, column=0, sticky="e", pady=3)
-        ttk.Combobox(mf, textvariable=self.col_phone_var, values=cols, width=6,
-                     state="readonly").grid(row=1, column=1, padx=4, sticky="w")
+        self.col_phone_cb = ttk.Combobox(mf, textvariable=self.col_phone_var, values=cols,
+                                         width=8, state="readonly")
+        self.col_phone_cb.grid(row=1, column=1, padx=4, sticky="w")
         ttk.Label(mf, text="销售顾问列:").grid(row=1, column=2, sticky="e", pady=3)
-        ttk.Combobox(mf, textvariable=self.col_role_var, values=cols + ["（不替换）"], width=10,
-                     state="readonly").grid(row=1, column=3, padx=4, sticky="w")
+        self.col_role_cb = ttk.Combobox(mf, textvariable=self.col_role_var, values=cols + ["（不替换）"],
+                                        width=12, state="readonly")
+        self.col_role_cb.grid(row=1, column=3, padx=4, sticky="w")
 
         ttk.Label(mf, text="提示：销售顾问列选「不替换」则保留 PSD 原文字。").grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -930,8 +936,9 @@ class App:
             self.psd_var.set(p)
 
     def _pick_xlsx(self):
+        # Stage 4：仅支持 .xlsx / .xlsm（.xls 在 load_excel_dataset 中明确拒绝）
         p = filedialog.askopenfilename(title="选择 Excel 数据",
-                                       filetypes=[("Excel", "*.xlsx *.xls"), ("所有", "*.*")])
+                                       filetypes=[("Excel", "*.xlsx *.xlsm"), ("所有", "*.*")])
         if p:
             self.xlsx_var.set(p)
             # 默认输出目录
@@ -944,6 +951,35 @@ class App:
         if d:
             self.out_var.set(d)
 
+    # ---------------- 列名工具（Stage 4）----------------
+    def _col_of(self, label):
+        """GUI 下拉 label（'A'/'B'/.../'AA'、'B - 门店' 或 '（不替换）'）-> 0 起列索引。"""
+        if label == "（不替换）":
+            return -1
+        # 兼容「B - 门店」格式（有表头时下拉显示列字母 - 表头名）
+        if label and " - " in label:
+            label = label.split(" - ")[0]
+        return excel_column_to_index(label)
+
+    def _set_column_options(self, max_columns):
+        """按实际工作表最大列数动态生成列下拉（支持 A..Z/AA/AB...）。
+
+        有表头时显示「列字母 - 表头名」格式（如 B - 门店）；无表头只显示列字母。
+        """
+        if max_columns <= 0:
+            max_columns = 1
+        cols = [index_to_excel_column(i) for i in range(max_columns)]
+        ds = self.excel_dataset
+        if ds is not None and ds.headers:
+            labels = [f"{c} - {ds.headers[i]}" if ds.headers[i] else c
+                      for i, c in enumerate(cols)]
+        else:
+            labels = cols
+        self._column_labels = labels
+        for cb in (self.col_store_cb, self.col_name_cb, self.col_phone_cb, self.col_role_cb):
+            if cb is not None:
+                cb["values"] = labels + (["（不替换）"] if cb is self.col_role_cb else [])
+
     # ---------------- 加载解析 ----------------
     def _load(self):
         psd = self.psd_var.get().strip()
@@ -955,21 +991,26 @@ class App:
             messagebox.showerror("错误", "请先选择有效的 Excel 数据文件。")
             return
 
-        # 读取 Excel 门店 + 列头
+        # 读取 Excel 门店 + 列头（Stage 4：统一入口 load_excel_dataset，修复 P1-01 ——
+        # 门店不再固定取 A 列，而是按用户配置的 col_store 列读取）
         try:
-            wb = openpyxl.load_workbook(xlsx, data_only=True)
-            ws = wb.active
-            rows = list(ws.iter_rows(values_only=True))
-            has_header = self.header_var.get()
-            start = 1 if has_header else 0
-            self.excel_headers = [chr(ord("A") + i) for i in range(max((len(r) for r in rows), default=0))]
-            stores = []
-            for r in rows[start:]:
-                if r and r[0] is not None and str(r[0]).strip():
-                    s = str(r[0]).strip()
-                    if s not in stores:
-                        stores.append(s)
+            ds = load_excel_dataset(
+                xlsx,
+                has_header=self.header_var.get(),
+                col_store=self._col_of(self.col_store_var.get()),
+                col_name=self._col_of(self.col_name_var.get()),
+                col_phone=self._col_of(self.col_phone_var.get()),
+                col_role=self._col_of(self.col_role_var.get()),
+            )
+            self.excel_dataset = ds
+            # 动态生成列下拉（按实际最大列数，支持 A..Z/AA/AB...）
+            self._set_column_options(ds.max_columns)
+            self.excel_headers = [index_to_excel_column(i) for i in range(ds.max_columns)]
+            stores = ds.stores
             self.excel_stores = stores
+        except ExcelDataError as e:
+            messagebox.showerror("Excel 错误", str(e))
+            return
         except Exception as e:
             messagebox.showerror("Excel 错误", str(e))
             return
@@ -1350,7 +1391,8 @@ class App:
 
     # ---------------- 运行 ----------------
     def _collect_cfg(self):
-        col_of = lambda v: -1 if v == "（不替换）" else ord(v) - ord("A")
+        # Stage 4：列下拉可能是「B - 门店」格式，_col_of 内部已 normalize
+        col_of = lambda v: self._col_of(v)
         # 保存用户显式勾选的图层（含组），用于下次加载时恢复
         # Stage 2：以 LayerRef dict 保存（layer_id/name/display_path），并保留 name 供旧版兼容
         def ref_to_cfg(label):
@@ -1461,20 +1503,24 @@ class App:
         cfg = dict(cfg)
         cfg["out_dir"] = tmp
         self._log_gui("生成预览（第1行数据）...")
-        # 预览只做第一行：用 col 读取第1行（COM 初始化由 Session 负责）
+        # 预览只做第一行（Stage 4：统一入口 load_excel_dataset，用 valid_rows[0]）
         try:
-            wb = openpyxl.load_workbook(cfg["xlsx_path"], data_only=True)
-            ws = wb.active
-            rows = list(ws.iter_rows(values_only=True))
-            start = 1 if cfg["has_header"] else 0
-            r = rows[start]
-            store = str(r[cfg["col_store"]]).strip() if r[cfg["col_store"]] is not None else ""
-            name = str(r[cfg["col_name"]]).strip()
-            phone_v = r[cfg["col_phone"]]
-            phone_s = str(int(phone_v)) if isinstance(phone_v, (int, float)) else str(phone_v).strip()
-            role = None
-            if cfg["col_role"] >= 0 and cfg["col_role"] < len(r) and r[cfg["col_role"]] is not None:
-                role = str(r[cfg["col_role"]]).strip()
+            ds = load_excel_dataset(
+                cfg["xlsx_path"],
+                has_header=cfg.get("has_header", True),
+                col_store=cfg["col_store"],
+                col_name=cfg["col_name"],
+                col_phone=cfg["col_phone"],
+                col_role=cfg["col_role"] if cfg.get("col_role", -1) >= 0 else None,
+            )
+            if not ds.valid_rows:
+                self._log_gui("Excel 中没有可生成的有效数据。")
+                return
+            r = ds.valid_rows[0]
+            store = r.store
+            name = r.name
+            phone_s = r.phone
+            role = r.role
 
             with PhotoshopSession() as ps:
                 app = ps.app
@@ -1577,12 +1623,13 @@ class App:
             self.psd_var.set(c.get("psd_path", ""))
             self.xlsx_var.set(c.get("xlsx_path", ""))
             self.out_var.set(c.get("out_dir", ""))
-            self.header_var.set(c.get("has_header", False))
-            self.col_store_var.set(chr(ord("A") + c.get("col_store", 0)))
-            self.col_name_var.set(chr(ord("A") + c.get("col_name", 1)))
-            self.col_phone_var.set(chr(ord("A") + c.get("col_phone", 3)))
+            self.header_var.set(c.get("has_header", True))
+            # Stage 4：列名用 index_to_excel_column（支持 AA/AB...）
+            self.col_store_var.set(index_to_excel_column(c.get("col_store", 0)))
+            self.col_name_var.set(index_to_excel_column(c.get("col_name", 1)))
+            self.col_phone_var.set(index_to_excel_column(c.get("col_phone", 3)))
             rv = c.get("col_role", 2)
-            self.col_role_var.set("（不替换）" if rv < 0 else chr(ord("A") + rv))
+            self.col_role_var.set("（不替换）" if rv < 0 else index_to_excel_column(rv))
             self.fmt_var.set(c.get("fmt", FMT_PNG))
             self.also_png_var.set(c.get("also_png", False))
             # 文字图层映射（加载后会在 _load 中按实际图层校正，这里仅预填）

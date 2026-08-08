@@ -115,7 +115,9 @@ def test_parse_rows_skips_empty():
     valid, skipped = parse_rows(rows, has_header=True)
     assert len(valid) == 1
     assert valid[0].name == "王兵"
-    assert skipped == [3, 4]
+    # Stage 4：skipped 现在返回 SkippedRow（含跳过原因，spec 第 8 节）
+    assert [s.excel_row for s in skipped] == [3, 4]
+    assert all(isinstance(s.reason, str) and s.reason for s in skipped)
 
 
 def test_parse_rows_20plus_columns():
