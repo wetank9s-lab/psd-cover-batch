@@ -6,7 +6,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.util import sanitize_filename, normalize_name, fuzzy_contains
+from core.util import sanitize_filename, normalize_name
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ def test_chinese_and_space_preserved():
 
 
 # ---------------------------------------------------------------------------
-# normalize_name / fuzzy_contains
+# normalize_name
 # ---------------------------------------------------------------------------
 def test_normalize_fullwidth_and_whitespace():
     # 全角→半角、全角空格、大小写
@@ -68,21 +68,3 @@ def test_normalize_fullwidth_and_whitespace():
     assert normalize_name("康 乐") == "康乐"
     assert normalize_name("　康乐　") == "康乐"
     assert normalize_name("KangLe") == "kangle"
-
-
-def test_fuzzy_contains_mutual():
-    # 康乐 <-> 康乐电器
-    assert fuzzy_contains("康乐", "康乐电器")
-    assert fuzzy_contains("康乐电器", "康乐")
-    # 九兴 <-> 九兴电器
-    assert fuzzy_contains("九兴", "九兴电器")
-    # 完全一致
-    assert fuzzy_contains("易田电器", "易田电器")
-    # 空值不匹配
-    assert not fuzzy_contains("", "康乐电器")
-    assert not fuzzy_contains("康乐", "")
-
-
-def test_fuzzy_not_contains_unrelated():
-    assert not fuzzy_contains("东山", "易田电器")
-    assert not fuzzy_contains("张三", "李四")

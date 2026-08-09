@@ -39,3 +39,6 @@ psd_cover_batch.spec
 test_console.spec
 Stage6_*.html
 Stage65_*.html
+
+# Stage 7 临时产物（不提交）
+_s7_*

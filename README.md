@@ -53,7 +53,7 @@ psd-cover-batch/
 │   ├── excel_data.py          #   Excel 解析：ExcelRow / ExcelDataset / 数据清洗
 │   ├── output_paths.py        #   输出目录：GroupFolderMap / 分组 / 碰撞处理
 │   └── util.py                #   文件名清洗等
-├── tests/                     # pytest 测试（251 个用例，全部可离线跑）
+├── tests/                     # pytest 测试（422 个用例，全部可离线跑）
 └── docs/GUI_WORKFLOW.md       # GUI 操作流程基线
 ```
 
@@ -81,11 +81,17 @@ pip install -r requirements.txt
 ### 1. 先看模板图层（确认图层名）
 
 ```bash
+python psd_cover_batch.py --psd 8081.psd --inspect
+```
+
+只查 PSD 图层树时**无需 Excel**。提供 `--xlsx` 时会额外输出「匹配到的门店 Logo 图层」
+（评分制 `match_store_logo`，歧义不自动选）与「品牌 Logo 图层」建议：
+
+```bash
 python psd_cover_batch.py --psd 8081.psd --xlsx 门店销售0803销售顾问.xlsx --inspect
 ```
 
-会打印图层树，并自动标出「匹配到的门店 Logo 图层」（图层名与 Excel 门店名「模糊包含」匹配）以及
-「品牌 Logo 图层」（名字含 logo，每张都显示）。如果名字对不上，按下面「PSD 模板规范」改脚本顶部的映射常量即可。
+如果名字对不上，按下面「PSD 模板规范」改脚本顶部的映射常量即可。
 
 ### 2. 先合成一行做测试
 
@@ -171,9 +177,12 @@ pip install pytest
 pytest tests/
 ```
 
-当前测试：**251 个用例**（`tests/test_excel_dataset.py`、`test_excel_parsing.py`、`test_filename.py`、
-`test_group_output.py`、`test_layer_index.py`、`test_logo_mapping.py`、`test_logo_matching.py`、
-`test_photoshop_session.py`、`test_renderer.py`），全部可离线运行。
+当前测试：**422 个用例**（`tests/test_cli.py`、`test_excel_dataset.py`、`test_excel_parsing.py`、
+`test_filename.py`、`test_group_output.py`、`test_gui_state.py`、`test_gui_styles.py`、
+`test_gui_view_model.py`、`test_layer_index.py`、`test_logo_mapping.py`、`test_photoshop_session.py`、
+`test_renderer.py`、`test_worker_events.py`），全部可离线运行。
+`test_cli.py` 额外做源码级红线扫描（AST 去 docstring 后校验 CLI 不含 Excel 解析、
+`Document.Duplicate`、`TextItem.Contents`、`Visible=`、`SaveAs` 等业务实现）。
 GUI 操作流程基线见 `docs/GUI_WORKFLOW.md`。
 
 ---
