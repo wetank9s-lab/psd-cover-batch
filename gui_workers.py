@@ -109,8 +109,11 @@ class TaskWorker(WorkerBase):
             # PSD（COM —— worker 线程内 Session）
             self.put_event(WorkerEvent(WorkerEvent.LOG,
                                        f"正在用 Photoshop 解析 PSD 图层：{os.path.basename(psd)}"))
+            force_reload = bool(cfg.get("force_reload", False))
             with PhotoshopSession() as ps:
-                doc = ps.open_document(psd)
+                # Stage 7.5：force_reload=True 时强制关闭已打开的旧版文档并从磁盘重读
+                # （拿到外部新增的门店/文字图层）；默认复用已打开文档（不打扰用户）。
+                doc = ps.open_document(psd, force_reload=force_reload)
                 time.sleep(0.6)
                 index = collect_layer_index(doc)
                 layers = index.layers
@@ -203,7 +206,7 @@ class TaskWorker(WorkerBase):
 
             # COM 生命周期全部在 worker 线程内
             with PhotoshopSession() as ps:
-                doc0 = ps.open_document(psd)
+                doc0 = ps.open_document(psd, force_reload=bool(cfg.get("psd_force_reload")))
                 time.sleep(0.6)
                 index = collect_layer_index(doc0)
                 logo_map = g._build_logo_mapping(cfg, index)
@@ -310,7 +313,8 @@ class TaskWorker(WorkerBase):
             # COM 全在 worker 线程内
             self.put_event(WorkerEvent(WorkerEvent.LOG, "正在启动 / 连接 Photoshop ..."))
             with PhotoshopSession() as ps:
-                doc0 = ps.open_document(cfg["psd_path"])
+                doc0 = ps.open_document(cfg["psd_path"],
+                                        force_reload=bool(cfg.get("psd_force_reload")))
                 time.sleep(0.6)
                 index = collect_layer_index(doc0)
                 logo_map = g._build_logo_mapping(cfg, index)

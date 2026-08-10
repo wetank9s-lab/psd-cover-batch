@@ -744,6 +744,9 @@ class App:
         self.excel_dataset = None
         # Stage 4 补充（BLOCKED 修复）：Dataset 一致性 key —— path/has_header/4 列任一变化即失效
         self._ds_key = None
+        # Stage 7.5：PSD 指纹（mtime）—— 记录最近一次成功 Load 时的磁盘状态，
+        # 用于检测「PSD 文件被外部修改（新增门店图层等）但 GUI 仍显示旧数据」。
+        self._psd_fingerprint = None     # (path, mtime, size) 或 None（未加载过）
         self.running = False
         self.stop_flag = threading.Event()
         self.worker = None
@@ -929,7 +932,7 @@ class App:
             except Exception:
                 pass
 
-    def _snapshot_for_load(self):
+    def _snapshot_for_load(self, force_reload=False):
         """Load 任务快照（纯 Python；main thread 收集）。"""
         return {
             "psd_path": self.psd_var.get().strip(),
@@ -939,7 +942,35 @@ class App:
             "col_name": self._col_of(self.col_name_var.get()),
             "col_phone": self._col_of(self.col_phone_var.get()),
             "col_role": self._col_of(self.col_role_var.get()),
+            # Stage 7.5：force_reload=True 时 worker 用 PhotoshopSession.open_document
+            # 的 force_reload 参数强制从磁盘重读 PSD（拿到外部新增的门店图层）。
+            "force_reload": bool(force_reload),
         }
+
+    @staticmethod
+    def _psd_fingerprint_of(path):
+        """PSD 磁盘指纹 (mtime, size)；不存在返回 None。"""
+        try:
+            import os
+            st = os.stat(path)
+            return (st.st_mtime, st.st_size)
+        except OSError:
+            return None
+
+    def _psd_changed_since_load(self):
+        """PSD 是否自上次成功 Load 后被外部修改（新增图层等）。
+
+        返回 True 仅当：上次成功 Load 的路径与当前 psd_var 一致，且
+        磁盘 (mtime, size) 与记录指纹不同。用于「开始/预览前提示刷新」。
+        """
+        fp = getattr(self, "_psd_fingerprint", None)
+        if fp is None:
+            return False
+        cur = self.psd_var.get().strip()
+        if not cur or fp[0] != cur:
+            return False
+        disk = self._psd_fingerprint_of(cur)
+        return disk is not None and disk != fp[1]
 
     def _snapshot_for_preview(self):
         cfg = self._collect_cfg()
@@ -1148,6 +1179,11 @@ class App:
         self.btn_load = tb.Button(bf, text="加载并分析",
                                   command=self._load, bootstyle=BS_MAIN, padding=(PAD_LG, PAD_SM))
         self.btn_load.pack(side="left")
+        # Stage 7.5：刷新图层 —— PSD 被外部修改（新增门店图层等）后强制从磁盘重读。
+        # 普通「加载并分析」在 PS 中已打开旧版时会复用旧文档；刷新会先关闭旧文档重开。
+        self.btn_refresh = tb.Button(bf, text="刷新图层", command=self._refresh_layers,
+                                     bootstyle=BS_WARNING)
+        self.btn_refresh.pack(side="left", padx=(PAD_SM, 0))
         self.btn_save_cfg = tb.Button(bf, text="保存配置", command=self._save_config,
                                       bootstyle=BS_OUTLINE_SECONDARY)
         self.btn_save_cfg.pack(side="left", padx=(PAD_SM, 0))
@@ -1497,8 +1533,30 @@ class App:
         self._rebuild_logo_lists()
         self._log_gui(f"门店映射已按新 Excel 列刷新：{len(stores)} 个门店。")
 
-    def _load(self):
-        """Stage 6: Load into worker. main thread only collects snapshot + starts worker."""
+    def _refresh_layers(self):
+        """Stage 7.5：刷新图层 —— PSD 被外部修改后强制从磁盘重读。
+
+        与「加载并分析」的区别：force_reload=True 会先关闭 Photoshop 中已打开的
+        旧版本文档再重新 Open，确保拿到磁盘最新图层（新增门店/文字层等）。
+        """
+        psd = self.psd_var.get().strip()
+        if not psd or not os.path.exists(psd):
+            messagebox.showerror("错误", "请先选择有效的 PSD 模板文件。")
+            return
+        if not self.layer_index:
+            # 尚未加载过：等同首次加载（无需强制重读，正常加载即可）
+            self._load(force_reload=False)
+            return
+        # 已加载过：强制重读磁盘最新版本
+        self._log_gui("[刷新图层] 正在强制从磁盘重新读取 PSD（关闭旧文档并重开）...")
+        self._load(force_reload=True)
+
+    def _load(self, force_reload=False):
+        """Stage 6: Load into worker. main thread only collects snapshot + starts worker.
+
+        force_reload=True（Stage 7.5）：PSD 文件已在 Photoshop 中打开过（可能被
+        外部修改新增图层），强制关闭旧文档并从磁盘重新读取最新版本。
+        """
         from core.task_events import AppState
         psd = self.psd_var.get().strip()
         xlsx = self.xlsx_var.get().strip()
@@ -1511,7 +1569,7 @@ class App:
         if self._task_worker.worker_alive:
             messagebox.showwarning("提示", "已有任务正在运行，请稍候。")
             return
-        cfg = self._snapshot_for_load()
+        cfg = self._snapshot_for_load(force_reload=force_reload)
         self._set_state(AppState.LOADING)
         try:
             self._task_worker.run_load(cfg)
@@ -1527,6 +1585,9 @@ class App:
             messagebox.showerror("加载错误", result.error or "加载失败。")
             self._set_state(AppState.IDLE)
             return
+        # Stage 7.5：成功 Load 后记录 PSD 磁盘指纹（检测外部修改用）
+        self._psd_fingerprint = (self.psd_var.get().strip(),
+                                 self._psd_fingerprint_of(self.psd_var.get().strip()))
         refs = [ref_from_config(d) for d in result.layer_refs]
         refs = [r for r in refs if r is not None]
         index = LayerIndex(refs)
@@ -2078,6 +2139,9 @@ class App:
             "logo_layers": logo_layers,
             "fmt": self.fmt_var.get(),
             "also_png": self.also_png_var.get(),
+            # Stage 7.5：PSD 已被外部修改且用户确认继续时，batch/preview 也强制
+            # 从磁盘重读最新 PSD（否则 open_document 会复用 PS 中旧版本文档）。
+            "psd_force_reload": bool(self._psd_changed_since_load()),
         }
 
     def all_psd_layers_labels(self):
@@ -2085,6 +2149,28 @@ class App:
         if self.layer_index is not None:
             return [self.layer_labels[r.id] for r in self.layer_index.layers]
         return list(self.all_psd_layers)
+
+    def _ensure_psd_fresh(self, trigger="开始"):
+        """Stage 7.5：PSD 是否被外部修改（新增图层）且 GUI 仍显示旧数据。
+
+        返回 True 可继续；False 时已提示用户「先刷新图层」（不自动弹错）。
+        """
+        if not self._psd_changed_since_load():
+            return True
+        self._log_gui(f"[PSD 变更检测] PSD 文件自上次加载后已被外部修改"
+                      f"（新增图层？），当前界面仍显示旧图层数据。"
+                      f"建议先点击「刷新图层」重新读取，再{trigger}。")
+        # 非阻塞提示：继续可能漏掉新图层，但由用户决定
+        ret = messagebox.askyesno(
+            "PSD 已变更",
+            f"PSD 模板文件自上次加载后已被修改（可能新增了门店/文字图层），\n"
+            f"当前界面仍显示旧图层数据。\n\n"
+            f"是否现在刷新图层？\n"
+            f"（选「否」将按当前旧图层继续{trigger}，新增图层不会被识别）")
+        if ret:
+            self._refresh_layers()
+            return False   # 已启动刷新任务，本次{trigger}取消
+        return True        # 用户选择不刷新，继续（按旧图层）
 
     def _start(self):
         """Stage 6: Batch into worker (single-worker constraint)."""
@@ -2094,6 +2180,8 @@ class App:
             messagebox.showwarning("提示", "已有任务正在运行，请稍候。")
             return
         if not self._ensure_dataset_fresh(trigger="开始"):
+            return
+        if not self._ensure_psd_fresh(trigger="开始"):
             return
         cfg = self._collect_cfg()
         if not cfg["psd_path"] or not os.path.exists(cfg["psd_path"]):
@@ -2137,6 +2225,8 @@ class App:
             messagebox.showwarning("提示", "已有任务正在运行，请稍候。")
             return
         if not self._ensure_dataset_fresh(trigger="预览"):
+            return
+        if not self._ensure_psd_fresh(trigger="预览"):
             return
         cfg = self._collect_cfg()
         if not cfg["psd_path"] or not os.path.exists(cfg["psd_path"]) or \
@@ -2197,6 +2287,14 @@ class App:
                 self._log_gui(f"  [失败 行{r.get('excel_row')}] {'；'.join(r['errors'])}")
         # Batch 单行失败 ≠ GUI ERROR：回 READY（Stage 6 #24）
         self._set_state(AppState.READY)
+        # Stage 7.5：batch 成功消费了最新 PSD（若有变更已用 psd_force_reload 重读），
+        # 同步更新指纹，避免下次开始/预览误报「PSD 已变更」。
+        try:
+            cur = self.psd_var.get().strip()
+            if cur and os.path.exists(cur):
+                self._psd_fingerprint = (cur, self._psd_fingerprint_of(cur))
+        except Exception:
+            pass
 
     # ---------------- Summary 渲染（规格 6.5B 第 17/18 节） ----------------
     def _render_summary_placeholder(self):

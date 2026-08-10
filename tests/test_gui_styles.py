@@ -339,3 +339,20 @@ def test_progress_bar_uses_primary():
     """#24 进度条样式使用 primary（规格 6.5B 第 19 节：非 success 绿）。"""
     assert "primary.Horizontal.TProgressbar" in _UI_CODE
     assert "success.Horizontal.TProgressbar" not in _UI_CODE
+
+
+def test_all_bootstyle_refs_are_defined():
+    """Stage 7.5 守卫：GUI 源码中所有 bootstyle=BS_* 引用必须存在于 gui_styles 常量。
+
+    防止再出现使用未定义常量（如 BS_OUTLINE_WARNING）导致的启动崩溃。
+    """
+    import re, os
+    here = os.path.dirname(__file__)
+    src_path = os.path.join(here, "..", "qifang_cover_maker.py")
+    with open(src_path, encoding="utf-8") as f:
+        src = f.read()
+    refs = set(re.findall(r"bootstyle\s*=\s*(BS_[A-Z_]+)", src))
+    defined = {n for n in dir(gs) if n.startswith("BS_")}
+    missing = refs - defined
+    assert not missing, f"GUI 引用了未定义的 bootstyle 常量: {sorted(missing)}"
+    assert refs, "未扫描到任何 bootstyle 引用（扫描逻辑失效？）"

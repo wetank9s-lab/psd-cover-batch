@@ -260,7 +260,7 @@ class PhotoshopSession:
     # ------------------------------------------------------------------
     # 文档登记 / 打开 / 复制 / 关闭
     # ------------------------------------------------------------------
-    def open_document(self, path):
+    def open_document(self, path, force_reload=False):
         """打开 PSD；若该文件已在 Photoshop 中打开则复用（不登记 owned），否则登记。
 
         关键安全点（真实集成发现）：Photoshop 的 app.Open(同路径) 在文件已打开时
@@ -269,8 +269,29 @@ class PhotoshopSession:
           - 打开前文件已在 PS 中（用户文档）→ 直接返回该 doc，**不登记 owned**，
             Session 退出绝不关闭它；
           - 打开前文件不存在 → Open 正常登记 owned，退出时关闭。
+
+        force_reload=True（Stage 7.5 新增）：强制从磁盘重新读取 PSD。
+        场景：用户在 Photoshop 外修改了 PSD（新增门店图层），但 PS 中仍打开着
+        旧版本文档 —— 此时 app.Open(同路径) 仍返回旧文档对象，拿不到新图层。
+        处理：找到已打开的同路径文档并关闭它（不登记 owned，也不 Quit PS），
+        再 Open 磁盘新版本（登记 owned，Session 退出时关闭）。
+        由调用方（GUI）负责判断"磁盘是否真的变了"；本方法只负责执行重读。
         """
         path = str(path)
+        if force_reload:
+            # 找到 PS 中已打开的同路径文档（用户文档或本工具打开的旧版）
+            existing = self._find_open_document_by_path(path)
+            if existing is not None:
+                try:
+                    existing.Close(2)  # 2 = SaveChangesDoNotSaveChanges
+                except Exception:
+                    pass
+                try:
+                    self.owned_documents.remove(existing)
+                except ValueError:
+                    pass
+            # 关闭后重新走正常打开流程（此时已不在 PS 中 -> 登记 owned）
+            return self.open_document(path, force_reload=False)
         # 1) 打开前：在已打开文档中查找同路径（大小写不敏感的绝对路径比对）
         existing = self._find_open_document_by_path(path)
         if existing is not None:

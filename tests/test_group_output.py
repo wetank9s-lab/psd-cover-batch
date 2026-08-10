@@ -590,3 +590,74 @@ def test_gui_min_fixture_has_group_col_cb():  # 防挂起回归：_set_column_op
     # _set_column_options 在 cb=None 时跳过（不 AttributeError）
     app.excel_dataset = None
     app._set_column_options(5)
+
+
+# ---------------------------------------------------------------------------
+# Stage 7.5：PSD 指纹 / 变更检测 / force_reload 快照
+# ---------------------------------------------------------------------------
+def test_psd_fingerprint_none_when_missing(tmp_path):
+    import qifang_cover_maker as g
+    app = _gui_min()
+    assert g.App._psd_fingerprint_of(str(tmp_path / "no.psd")) is None
+
+
+def test_psd_fingerprint_records_mtime_size(tmp_path):
+    import qifang_cover_maker as g
+    p = tmp_path / "t.psd"
+    p.write_bytes(b"PSD-BYTES-1")
+    fp = g.App._psd_fingerprint_of(str(p))
+    assert fp is not None and len(fp) == 2
+    mtime, size = fp
+    assert size == len(b"PSD-BYTES-1")
+    # 修改后指纹变化
+    p.write_bytes(b"PSD-BYTES-2-LONGER")
+    fp2 = g.App._psd_fingerprint_of(str(p))
+    assert fp2 != fp
+
+
+def test_psd_changed_since_load_false_when_no_fingerprint():
+    import qifang_cover_maker as g
+    app = _gui_min()
+    # 未加载过（无指纹）-> 不认为变更
+    assert app._psd_changed_since_load() is False
+
+
+def test_psd_changed_since_load_true_after_external_modify(tmp_path):
+    import qifang_cover_maker as g
+    app = _gui_min()
+    p = tmp_path / "t.psd"
+    p.write_bytes(b"V1")
+    app.psd_var.set(str(p))
+    # 模拟成功 Load 后记录指纹
+    app._psd_fingerprint = (str(p), g.App._psd_fingerprint_of(str(p)))
+    assert app._psd_changed_since_load() is False
+    # 外部修改（新增图层 -> 文件变大 / mtime 变化）
+    import time as _t
+    p.write_bytes(b"V2-LONGER-NEW-LAYERS")
+    # mtime 粒度问题：size 变化已足够触发
+    assert app._psd_changed_since_load() is True
+
+
+def test_psd_changed_since_load_false_when_path_switched(tmp_path):
+    import qifang_cover_maker as g
+    app = _gui_min()
+    p1 = tmp_path / "a.psd"
+    p2 = tmp_path / "b.psd"
+    p1.write_bytes(b"V1")
+    p2.write_bytes(b"V1")
+    app.psd_var.set(str(p1))
+    app._psd_fingerprint = (str(p1), g.App._psd_fingerprint_of(str(p1)))
+    # 用户切换了 PSD 路径 -> 指纹不适用（视为未变更，等重新加载）
+    app.psd_var.set(str(p2))
+    assert app._psd_changed_since_load() is False
+
+
+def test_snapshot_for_load_force_reload_flag(tmp_path):
+    import qifang_cover_maker as g
+    app = _gui_min()
+    snap = app._snapshot_for_load(force_reload=True)
+    assert snap["force_reload"] is True
+    snap2 = app._snapshot_for_load(force_reload=False)
+    assert snap2["force_reload"] is False
+    snap3 = app._snapshot_for_load()
+    assert snap3["force_reload"] is False

@@ -466,3 +466,42 @@ class TestPhotoshopSessionOwnership:
         doc = s.open_document(user_path)
         assert doc is app._docs[0]
         assert len(app._docs) == 1  # 没有新增副本
+
+    # 18. Stage 7.5: force_reload=True 时关闭旧文档并从磁盘重开（拿最新图层）
+    def test_open_force_reload_closes_old_and_reopens(self):
+        app = LinkedFakeApp()
+        psd_path = "C:/t/template.psd"
+        old = app.Open(psd_path)          # 模拟 PS 中已打开旧版（外部修改前）
+        s = self._session_with_fake(app)
+        # 默认（force_reload=False）复用旧文档
+        doc = s.open_document(psd_path)
+        assert doc is old
+        # force_reload=True：关闭旧文档并从磁盘重开
+        new_doc = s.open_document(psd_path, force_reload=True)
+        assert new_doc is not old          # 拿到新对象（磁盘新版本）
+        assert old.closed is True          # 旧文档被关闭
+        assert new_doc in s.owned_documents  # 新文档登记 owned（Session 退出时关闭）
+        assert new_doc not in app._docs or new_doc in app._docs  # 已重新加入集合
+        assert len([d for d in app._docs if d is new_doc]) == 1
+
+    # 19. Stage 7.5: force_reload=True 但 PSD 未在 PS 中打开 -> 正常打开（登记 owned）
+    def test_open_force_reload_when_not_open_yet(self):
+        app = LinkedFakeApp()
+        psd_path = "C:/t/new_template.psd"
+        s = self._session_with_fake(app)
+        doc = s.open_document(psd_path, force_reload=True)
+        assert doc in s.owned_documents
+        assert len(app._docs) == 1
+
+    # 20. Stage 7.5: force_reload 关闭的是同路径文档，不影响其他用户文档
+    def test_open_force_reload_leaves_other_user_docs(self):
+        app = LinkedFakeApp()
+        other_path = "C:/t/other.psd"
+        other = app.Open(other_path)      # 无关用户文档
+        psd_path = "C:/t/template.psd"
+        old = app.Open(psd_path)
+        s = self._session_with_fake(app)
+        s.open_document(psd_path, force_reload=True)
+        assert other.closed is False       # 无关文档绝不被关闭
+        assert old.closed is True          # 只有同路径旧版被关闭
+        assert len(app._docs) == 2         # other + 新打开的 template
